@@ -1,0 +1,22 @@
+{
+  "name": "@clash/server",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch --watch-path=src --watch-path=../../packages/shared/src src/index.ts",
+    "start": "node src/index.ts"
+  },
+  "dependencies": {
+    "@clash/shared": "*",
+    "@hono/node-server": "^2.1.1",
+    "@hono/zod-validator": "^0.9.1",
+    "hono": "^4.13.8",
+    "ws": "^8.21.3",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.5.2",
+    "@types/ws": "^8.18.1",
+    "typescript": "^5.9.3"
+  }
+}
