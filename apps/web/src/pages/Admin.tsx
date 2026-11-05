@@ -1,18 +1,30 @@
 import {
   ARENA_CONFIG_META,
+  CARD_IDS,
+  CARD_TUNE_KEYS,
+  CARD_TUNE_META,
   CONFIG_META,
   DEFAULT_ARENA,
   DEFAULT_CONFIG,
+  cardBrief,
+  defaultCardTable,
+  roleLabel,
+  tunedCard,
   type ArenaConfig,
+  type CardId,
+  type CardTable,
+  type CardTune,
   type GameConfig,
 } from '@clash/shared';
 import { useState } from 'react';
 
 import {
   fetchArenaSettings,
+  fetchCardTable,
   fetchMatches,
   fetchSettings,
   putArenaSettings,
+  putCardTable,
   putSettings,
   type MatchRecord,
 } from '../api';
@@ -27,9 +39,10 @@ const ARENA_KEYS = Object.keys(DEFAULT_ARENA) as (keyof ArenaConfig)[];
 
 export function Admin({ onBack }: Props) {
   const [pin, setPin] = useState(sessionStorage.getItem('clash.pin') ?? '');
-  const [tab, setTab] = useState<'spray' | 'arena'>('arena');
+  const [tab, setTab] = useState<'spray' | 'arena' | 'cards'>('arena');
   const [spray, setSpray] = useState<GameConfig | null>(null);
   const [arena, setArena] = useState<ArenaConfig | null>(null);
+  const [cards, setCards] = useState<CardTable | null>(null);
   const [matches, setMatches] = useState<MatchRecord[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
@@ -39,28 +52,42 @@ export function Admin({ onBack }: Props) {
     try {
       const next = await fetchSettings(pin);
       const ar = await fetchArenaSettings(pin);
+      const tuned = await fetchCardTable(pin);
       sessionStorage.setItem('clash.pin', pin);
       setSpray(next);
       setArena(ar);
+      setCards(tuned);
       setMatches(await fetchMatches(pin));
     } catch {
       setError('Bad PIN or API is down.');
       setSpray(null);
       setArena(null);
+      setCards(null);
     }
   };
 
   const save = async () => {
-    if (spray === null || arena === null) return;
+    if (spray === null || arena === null || cards === null) return;
     setError(null);
     setSaved(false);
     try {
       if (tab === 'spray') setSpray(await putSettings(pin, spray));
-      else setArena(await putArenaSettings(pin, arena));
+      else if (tab === 'arena') setArena(await putArenaSettings(pin, arena));
+      else setCards(await putCardTable(pin, cards));
       setSaved(true);
     } catch {
       setError('Could not save.');
     }
+  };
+
+  const setTune = (id: CardId, key: keyof CardTune, raw: number) => {
+    const meta = CARD_TUNE_META[key];
+    const value = meta.step >= 1 ? Math.round(raw) : raw;
+    setCards((prev) => {
+      if (prev === null) return prev;
+      return { ...prev, [id]: { ...prev[id], [key]: value } };
+    });
+    setSaved(false);
   };
 
   return (
@@ -72,10 +99,10 @@ export function Admin({ onBack }: Props) {
           <p className="eyebrow">control deck</p>
           <h1>ADMIN</h1>
           <p className="lede">
-            Live variables seed the next match. Spray and Arena are stored
-            separately. Default PIN is <code>clash</code>.
+            Live variables seed the next match. Spray, Arena, and card
+            strengths are stored separately. Default PIN is <code>clash</code>.
           </p>
-          {spray === null || arena === null ? (
+          {spray === null || arena === null || cards === null ? (
             <div className="row">
               <label className="field">
                 Admin PIN
@@ -94,7 +121,7 @@ export function Admin({ onBack }: Props) {
             </div>
           ) : (
             <>
-              <div className="mode">
+              <div className="mode tabs-3">
                 <button
                   type="button"
                   className={tab === 'arena' ? 'on' : ''}
@@ -109,8 +136,70 @@ export function Admin({ onBack }: Props) {
                 >
                   Spray
                 </button>
+                <button
+                  type="button"
+                  className={tab === 'cards' ? 'on' : ''}
+                  onClick={() => setTab('cards')}
+                >
+                  Cards
+                </button>
               </div>
-              {tab === 'spray' ? (
+              {tab === 'cards' ? (
+                <>
+                  <p className="lede">
+                    These numbers seed the next match. Ember lands on any open
+                    cell and ignores the blocks slider. Towers stay planted
+                    even if speed is raised.
+                  </p>
+                  <div className="tune-list">
+                    {CARD_IDS.map((id) => {
+                      const def = tunedCard(cards, id);
+                      if (def === null) return null;
+                      const tune = cards[id];
+                      return (
+                        <section className="tune-card" key={id}>
+                          <img
+                            className="tune-portrait"
+                            src={`/cards/${id}.png`}
+                            alt={def.name}
+                          />
+                          <div className="tune-main">
+                          <h3>
+                            {def.name}{' '}
+                            <span className="hint">{roleLabel(def.role)}</span>
+                          </h3>
+                          <p className="brief">{cardBrief(def)}</p>
+                          <div className="grid-vars">
+                            {CARD_TUNE_KEYS.map((key) => {
+                              const meta = CARD_TUNE_META[key];
+                              return (
+                                <div className="var" key={key}>
+                                  <header>
+                                    <span>{meta.label}</span>
+                                    <b>{formatVal(tune[key])}</b>
+                                  </header>
+                                  <div className="hint">{meta.hint}</div>
+                                  <input
+                                    type="range"
+                                    min={meta.min}
+                                    max={meta.max}
+                                    step={meta.step}
+                                    value={tune[key]}
+                                    onChange={(e) => {
+                                      setTune(id, key, Number(e.target.value));
+                                    }}
+                                  />
+                                </div>
+                              );
+                            })}
+                          </div>
+                          </div>
+                        </section>
+                      );
+                    })}
+                  </div>
+                </>
+              ) : tab === 'spray' ? (
                 <div className="grid-vars">
                   {SPRAY_KEYS.map((key) => {
                     const meta = CONFIG_META[key];
@@ -184,7 +273,8 @@ export function Admin({ onBack }: Props) {
                   type="button"
                   onClick={() => {
                     if (tab === 'spray') setSpray({ ...DEFAULT_CONFIG });
-                    else setArena({ ...DEFAULT_ARENA });
+                    else if (tab === 'arena') setArena({ ...DEFAULT_ARENA });
+                    else setCards(defaultCardTable());
                     setSaved(false);
                   }}
                 >
@@ -228,7 +318,7 @@ export function Admin({ onBack }: Props) {
             <button className="linkish" type="button" onClick={onBack}>
               ← back
             </button>
-            <span>PUT /api/admin/settings · /api/admin/arena</span>
+            <span>PUT /api/admin/settings · /api/admin/arena · /api/admin/cards</span>
           </div>
         </div>
       </div>

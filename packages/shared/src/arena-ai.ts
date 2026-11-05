@@ -1,4 +1,4 @@
-import { cardOf, isSpell, type CardId } from './cards.ts';
+import { tunedCard, type CardId } from './cards.ts';
 import type { ArenaConfig } from './arena-config.ts';
 import type { Rng } from './ai.ts';
 import type { Side } from './kinds.ts';
@@ -22,7 +22,7 @@ export function arenaAi(
   if (rng() > 0.32 + config.aiSkill * 0.55) return null;
 
   const affordable = me.hand
-    .map((id) => cardOf(id))
+    .map((id) => tunedCard(sim.cards, id))
     .filter((d): d is NonNullable<typeof d> => d !== null && d.cost <= me.energy + 1e-6);
 
   if (affordable.length === 0) return null;
@@ -70,31 +70,21 @@ function deployPoint(
   cardId: CardId,
   rng: Rng,
 ): { x: number; y: number } | null {
-  if (isSpell(cardId)) {
-    const enemy: Side = side === 1 ? 2 : 1;
-    for (let i = 0; i < 24; i += 1) {
-      const x = rng() * config.arenaW;
-      const y = rng() * config.arenaH;
-      if (ownerAt(sim.grid, config.arenaW, config.arenaH, x, y) === enemy) {
-        return { x, y };
-      }
-    }
-    return { x: config.arenaW * 0.5, y: config.arenaH * 0.5 };
-  }
-  const front = side === 1 ? config.arenaH * 0.42 : config.arenaH * 0.58;
-  for (let i = 0; i < 40; i += 1) {
-    const x = 1 + rng() * (config.arenaW - 2);
-    const y = front + (rng() - 0.5) * 8;
-    if (ownerAt(sim.grid, config.arenaW, config.arenaH, x, y) === side) {
-      return { x, y };
+  const w = config.arenaW;
+  const h = config.arenaH;
+  const mid = h / 2;
+  let best: { x: number; y: number } | null = null;
+  let bestScore = Infinity;
+  for (let y = 0; y < h; y += 1) {
+    for (let x = 0; x < w; x += 1) {
+      const px = x + 0.5;
+      const py = y + 0.5;
+      if (!canPlayAt(sim, config, side, cardId, px, py)) continue;
+      const score = Math.abs(py - mid) + rng();
+      if (score >= bestScore) continue;
+      bestScore = score;
+      best = { x: px, y: py };
     }
   }
-  for (let i = 0; i < 40; i += 1) {
-    const x = 1 + rng() * (config.arenaW - 2);
-    const y = 1 + rng() * (config.arenaH - 2);
-    if (ownerAt(sim.grid, config.arenaW, config.arenaH, x, y) === side) {
-      return { x, y };
-    }
-  }
-  return null;
+  return best;
 }

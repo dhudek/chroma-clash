@@ -1,4 +1,5 @@
 import {
+  acceptDeck,
   NEUTRAL_INPUT,
   PROTOCOL_VERSION,
   aiInput,
@@ -8,6 +9,7 @@ import {
   countdownLeftSec,
   createArena,
   createSim,
+  mergeCardTable,
   dashReadyIn,
   encodeGrid,
   forfeit,
@@ -23,6 +25,8 @@ import {
   tryPlay,
   type ArenaConfig,
   type ArenaSim,
+  type CardId,
+  type CardTable,
   type ClientMsg,
   type DirtyCell,
   type GameConfig,
@@ -45,23 +49,28 @@ import {
 } from './db.ts';
 import {
   loadArenaSettings,
+  loadCardTable,
   loadSettings,
   saveArenaSettings,
+  saveCardTable,
   saveSettings,
 } from './settings.ts';
 
 const ROOM_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const GRACE_MS = 100_000;
 
 type Socket = WSContext;
 
 type Session = {
   id: string;
   name: string;
-  ws: Socket;
+  ws: Socket | null;
   match: LiveMatch | null;
   side: Side | null;
   input: PlayerInput;
   want: GameKind;
+  deck: CardId[];
+  grace: ReturnType<typeof setTimeout> | null;
 };
 
 type SprayMatch = {
@@ -95,17 +104,22 @@ type LiveMatch = SprayMatch | ArenaMatch;
 
 export class GameHub {
   private readonly db: AppDb;
+  private readonly graceMs: number;
   private readonly sessions = new Map<Socket, Session>();
+  private readonly byGuest = new Map<string, Session>();
   private readonly sprayQueue: Session[] = [];
   private readonly arenaQueue: Session[] = [];
   private readonly rooms = new Map<string, { host: Session; game: GameKind }>();
   private settings: GameConfig;
   private arenaSettings: ArenaConfig;
+  private cardTable: CardTable;
 
-  constructor(db: AppDb) {
+  constructor(db: AppDb, graceMs = GRACE_MS) {
     this.db = db;
+    this.graceMs = graceMs;
     this.settings = loadSettings(db);
     this.arenaSettings = loadArenaSettings(db);
+    this.cardTable = loadCardTable(db);
   }
 
   getSettings(): GameConfig {
@@ -126,6 +140,15 @@ export class GameHub {
     return this.arenaSettings;
   }
 
+  getCardTable(): CardTable {
+    return this.cardTable;
+  }
+
+  setCardTable(table: CardTable): CardTable {
+    this.cardTable = saveCardTable(this.db, table);
+    return this.cardTable;
+  }
+
   recentMatches(): MatchRow[] {
     return listMatches(this.db);
   }
@@ -143,17 +166,21 @@ export class GameHub {
     switch (msg.type) {
       case 'play_cpu':
         session.want = gameOf(msg);
+        session.deck = acceptDeck(msg.deck);
         this.playCpu(session);
         break;
       case 'queue':
         session.want = gameOf(msg);
+        session.deck = acceptDeck(msg.deck);
         this.enqueue(session);
         break;
       case 'create_room':
         session.want = gameOf(msg);
+        session.deck = acceptDeck(msg.deck);
         this.createRoom(session);
         break;
       case 'join_room':
+        session.deck = acceptDeck(msg.deck);
         this.joinRoom(session, msg.code);
         break;
       case 'input':
@@ -179,27 +206,45 @@ export class GameHub {
   disconnect(ws: Socket): void {
     const session = this.sessions.get(ws);
     this.sessions.delete(ws);
-    if (session === undefined) return;
-    this.removeFromQueue(session);
-    this.removeFromRooms(session);
-    if (session.match !== null && session.side !== null) {
-      const winner: Side = session.side === 1 ? 2 : 1;
-      this.endMatch(session.match, winner, 'forfeit');
+    if (session === undefined || session.ws !== ws) return;
+    session.ws = null;
+    if (this.held(session)) {
+      this.armGrace(session);
+      return;
     }
+    this.byGuest.delete(session.id);
   }
 
   private hello(ws: Socket, guestId: string, name: string): void {
-    const existing = this.sessions.get(ws);
-    if (existing !== undefined) {
+    const bound = this.sessions.get(ws);
+    if (bound !== undefined) {
       this.send(ws, {
         type: 'welcome',
-        guestId: existing.id,
-        name: existing.name,
+        guestId: bound.id,
+        name: bound.name,
         protocol: PROTOCOL_VERSION,
+        ...(this.held(bound) ? { resume: true } : {}),
       });
       return;
     }
     const id = guestId.length > 0 ? guestId : crypto.randomUUID();
+    const parked = this.byGuest.get(id);
+    if (parked !== undefined) {
+      this.clearGrace(parked);
+      if (parked.ws !== null) this.sessions.delete(parked.ws);
+      parked.ws = ws;
+      this.sessions.set(ws, parked);
+      const resume = this.held(parked);
+      this.send(ws, {
+        type: 'welcome',
+        guestId: parked.id,
+        name: parked.name,
+        protocol: PROTOCOL_VERSION,
+        ...(resume ? { resume: true } : {}),
+      });
+      if (resume) this.replay(parked);
+      return;
+    }
     const session: Session = {
       id,
       name: sanitizeName(name, randomName()),
@@ -208,8 +253,11 @@ export class GameHub {
       side: null,
       input: { ...NEUTRAL_INPUT },
       want: 'spray',
+      deck: acceptDeck(undefined),
+      grace: null,
     };
     this.sessions.set(ws, session);
+    this.byGuest.set(session.id, session);
     this.send(ws, {
       type: 'welcome',
       guestId: session.id,
@@ -317,7 +365,7 @@ export class GameHub {
 
   private startSpray(mode: MatchMode, p1: Session, p2: Session | null): void {
     const config: GameConfig = { ...this.settings };
-    const sim = createSim(config);
+    const sim = createSim(config, Math.random);
     const match = {
       kind: 'spray' as const,
       id: crypto.randomUUID(),
@@ -363,7 +411,11 @@ export class GameHub {
 
   private startArena(mode: MatchMode, p1: Session, p2: Session | null): void {
     const config: ArenaConfig = { ...this.arenaSettings };
-    const sim = createArena(config);
+    const cards = mergeCardTable(this.cardTable);
+    const sim = createArena(config, Math.random, cards, {
+      p1: p1.deck,
+      p2: p2?.deck,
+    });
     const match = {
       kind: 'arena' as const,
       id: crypto.randomUUID(),
@@ -390,6 +442,7 @@ export class GameHub {
       side: 1,
       names: { p1: p1.name, p2: p2Name },
       config,
+      cards,
       state: this.arenaSnapshot(match, 1, true),
     });
     if (p2 !== null) {
@@ -401,6 +454,7 @@ export class GameHub {
         side: 2,
         names: { p1: p1.name, p2: p2.name },
         config,
+        cards,
         state: this.arenaSnapshot(match, 2, true),
       });
     }
@@ -585,6 +639,8 @@ export class GameHub {
     session.match = null;
     session.side = null;
     session.input = { ...NEUTRAL_INPUT };
+    this.clearGrace(session);
+    if (session.ws === null) this.byGuest.delete(session.id);
   }
 
   private spraySnapshot(
@@ -615,6 +671,7 @@ export class GameHub {
       scores: countScores(match.sim.grid),
       dirty,
       winner: match.sim.winner,
+      mapName: match.sim.mapName,
     };
     if (full) payload.grid = encodeGrid(match.sim.grid);
     return payload;
@@ -655,7 +712,92 @@ export class GameHub {
     return crypto.randomUUID().slice(0, 4).toUpperCase();
   }
 
-  private send(ws: Socket, msg: ServerMsg): void {
+  private held(session: Session): boolean {
+    if (session.match !== null) return true;
+    if (this.sprayQueue.includes(session) || this.arenaQueue.includes(session)) return true;
+    for (const room of this.rooms.values()) {
+      if (room.host === session) return true;
+    }
+    return false;
+  }
+
+  private armGrace(session: Session): void {
+    this.clearGrace(session);
+    session.grace = setTimeout(() => this.expire(session), this.graceMs);
+  }
+
+  private clearGrace(session: Session): void {
+    if (session.grace === null) return;
+    clearTimeout(session.grace);
+    session.grace = null;
+  }
+
+  private expire(session: Session): void {
+    session.grace = null;
+    if (session.ws !== null) return;
+    this.removeFromQueue(session);
+    this.removeFromRooms(session);
+    if (session.match !== null && session.side !== null) {
+      const winner: Side = session.side === 1 ? 2 : 1;
+      this.endMatch(session.match, winner, 'forfeit');
+    }
+    this.byGuest.delete(session.id);
+  }
+
+  private replay(session: Session): void {
+    const match = session.match;
+    if (match !== null && session.side !== null) {
+      this.replayMatch(session, match);
+      return;
+    }
+    if (this.sprayQueue.includes(session) || this.arenaQueue.includes(session)) {
+      this.send(session.ws, { type: 'queued' });
+      this.send(session.ws, { type: 'waiting', message: 'Searching the void…' });
+      return;
+    }
+    for (const [code, room] of this.rooms) {
+      if (room.host !== session) continue;
+      this.send(session.ws, { type: 'room', code });
+      this.send(session.ws, {
+        type: 'waiting',
+        message: `Room ${code} · waiting for a hunter`,
+      });
+      return;
+    }
+  }
+
+  private replayMatch(session: Session, match: LiveMatch): void {
+    const side = session.side;
+    if (side === null) return;
+    const p2Name = match.p2?.name ?? 'VOID-CPU';
+    if (match.kind === 'spray') {
+      this.send(session.ws, {
+        type: 'match_start',
+        game: 'spray',
+        matchId: match.id,
+        mode: match.mode,
+        side,
+        names: { p1: match.p1.name, p2: p2Name },
+        config: match.config,
+        state: this.spraySnapshot(match, side, true),
+      });
+      return;
+    }
+    this.send(session.ws, {
+      type: 'match_start',
+      game: 'arena',
+      matchId: match.id,
+      mode: match.mode,
+      side,
+      names: { p1: match.p1.name, p2: p2Name },
+      config: match.config,
+      cards: match.sim.cards,
+      state: this.arenaSnapshot(match, side, true),
+    });
+  }
+
+  private send(ws: Socket | null, msg: ServerMsg): void {
+    if (ws === null) return;
     try {
       ws.send(JSON.stringify(msg));
     } catch {

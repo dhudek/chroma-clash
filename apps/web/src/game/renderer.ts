@@ -2,6 +2,7 @@ import {
   decodeGrid,
   type DirtyCell,
   type GameConfig,
+  type Phase,
   type Side,
   type StatePayload,
 } from '@clash/shared';
@@ -31,6 +32,7 @@ export class ArenaRenderer {
     [];
   private lastTick = 0;
   private tickMs = 50;
+  private phase: Phase = 'countdown';
   private layout = { ox: 0, oy: 0, cell: 16, dw: 0, dh: 0 };
 
   constructor(canvas: HTMLCanvasElement) {
@@ -59,6 +61,7 @@ export class ArenaRenderer {
     this.currOpp = { ...this.opp, t: now };
     this.youTrail = [];
     this.oppTrail = [];
+    this.phase = state.phase;
     this.resize();
     this.rebuildPaint();
   }
@@ -72,12 +75,13 @@ export class ArenaRenderer {
     } else {
       this.applyDirty(state.dirty);
     }
+    this.phase = state.phase;
     this.you.x += (state.you.x - this.you.x) * 0.45;
     this.you.y += (state.you.y - this.you.y) * 0.45;
     const now = performance.now();
     this.prevOpp = { ...this.currOpp, t: this.currOpp.t };
     this.currOpp = { x: state.opp.x, y: state.opp.y, t: now };
-    if (state.tick !== this.lastTick) {
+    if (state.phase !== 'countdown' && state.tick !== this.lastTick) {
       this.lastTick = state.tick;
       this.burst(state.you.x, state.you.y, this.side === 1 ? MAGENTA : CYAN);
     }
@@ -85,15 +89,32 @@ export class ArenaRenderer {
 
   predict(dx: number, dy: number, dt: number, dashing: boolean): void {
     const cfg = this.config;
-    if (cfg === null) return;
+    if (cfg === null || this.phase === 'countdown') return;
     const mag = Math.hypot(dx, dy);
     if (mag < 0.04) return;
     const speed = cfg.speed * (dashing ? cfg.dashMul : 1);
-    this.you.x += (dx / mag) * speed * dt;
-    this.you.y += (dy / mag) * speed * dt;
+    const dxs = (dx / mag) * speed * dt;
+    const dys = (dy / mag) * speed * dt;
     const pad = 0.45;
-    this.you.x = clamp(this.you.x, pad, cfg.arenaW - pad);
-    this.you.y = clamp(this.you.y, pad, cfg.arenaH - pad);
+    const nx = clamp(this.you.x + dxs, pad, cfg.arenaW - pad);
+    const ny = clamp(this.you.y + dys, pad, cfg.arenaH - pad);
+    if (!this.blocked(nx, ny)) {
+      this.you.x = nx;
+      this.you.y = ny;
+    } else if (!this.blocked(nx, this.you.y)) {
+      this.you.x = nx;
+    } else if (!this.blocked(this.you.x, ny)) {
+      this.you.y = ny;
+    }
+  }
+
+  private blocked(x: number, y: number): boolean {
+    const cfg = this.config;
+    if (cfg === null) return false;
+    const cx = Math.floor(x);
+    const cy = Math.floor(y);
+    if (cx < 0 || cy < 0 || cx >= cfg.arenaW || cy >= cfg.arenaH) return true;
+    return this.grid[cy * cfg.arenaW + cx] === 3;
   }
 
   resize(): void {
@@ -137,12 +158,14 @@ export class ArenaRenderer {
     this.opp.x = lerp(this.prevOpp.x, this.currOpp.x, u);
     this.opp.y = lerp(this.prevOpp.y, this.currOpp.y, u);
 
-    this.pushTrail(this.youTrail, this.you.x, this.you.y);
-    this.pushTrail(this.oppTrail, this.opp.x, this.opp.y);
-    this.drawTrail(this.youTrail, this.side === 1 ? MAGENTA : CYAN);
-    this.drawTrail(this.oppTrail, this.side === 1 ? CYAN : MAGENTA);
-    this.drawPlayer(this.opp.x, this.opp.y, this.side === 1 ? CYAN : MAGENTA, false);
-    this.drawPlayer(this.you.x, this.you.y, this.side === 1 ? MAGENTA : CYAN, true);
+    if (this.phase !== 'countdown') {
+      this.pushTrail(this.youTrail, this.you.x, this.you.y);
+      this.pushTrail(this.oppTrail, this.opp.x, this.opp.y);
+      this.drawTrail(this.youTrail, this.side === 1 ? MAGENTA : CYAN);
+      this.drawTrail(this.oppTrail, this.side === 1 ? CYAN : MAGENTA);
+      this.drawPlayer(this.opp.x, this.opp.y, this.side === 1 ? CYAN : MAGENTA, false);
+      this.drawPlayer(this.you.x, this.you.y, this.side === 1 ? MAGENTA : CYAN, true);
+    }
     this.drawSparks(dt);
     ctx.restore();
     this.vignette();
@@ -180,6 +203,15 @@ export class ArenaRenderer {
     const s = scale - gap;
     const px = x * scale + gap / 2;
     const py = y * scale + gap / 2;
+    if (owner === 3) {
+      this.pctx.fillStyle = '#1b2438';
+      round(this.pctx, px, py, s, s, 4);
+      this.pctx.fill();
+      this.pctx.fillStyle = 'rgba(186, 206, 240, 0.28)';
+      round(this.pctx, px, py, s, s * 0.35, 4);
+      this.pctx.fill();
+      return;
+    }
     const rgb = owner === 1 ? MAGENTA : owner === 2 ? CYAN : null;
     if (rgb === null) {
       this.pctx.clearRect(x * scale, y * scale, scale, scale);

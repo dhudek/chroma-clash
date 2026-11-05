@@ -1,4 +1,6 @@
+import { mulberry32, type Rng } from './ai.ts';
 import type { GameConfig } from './config.ts';
+import { BLOCKED, MAP_NAMES, rollMap, slide } from './maps.ts';
 import {
   NEUTRAL_INPUT,
   clampInput,
@@ -7,6 +9,7 @@ import {
   type Side,
   type Winner,
 } from './protocol.ts';
+import type { MapId } from './maps.ts';
 
 export type PlayerState = {
   x: number;
@@ -20,6 +23,8 @@ export type PlayerState = {
 export type SimState = {
   tick: number;
   grid: Uint8Array;
+  mapId: MapId;
+  mapName: string;
   p1: PlayerState;
   p2: PlayerState;
   over: boolean;
@@ -31,7 +36,9 @@ export type StepResult = {
   dirty: number[];
 };
 
-export function createSim(config: GameConfig): SimState {
+export function createSim(config: GameConfig, rng: Rng = mulberry32(0xc0ffee)): SimState {
+  const grid = new Uint8Array(config.arenaW * config.arenaH);
+  const mapId = rollMap(grid, config.arenaW, config.arenaH, rng);
   const p1: PlayerState = {
     x: 2.5,
     y: config.arenaH / 2,
@@ -50,7 +57,9 @@ export function createSim(config: GameConfig): SimState {
   };
   return {
     tick: 0,
-    grid: new Uint8Array(config.arenaW * config.arenaH),
+    grid,
+    mapId,
+    mapName: MAP_NAMES[mapId],
     p1,
     p2,
     over: false,
@@ -131,8 +140,8 @@ export function step(
   const in2 = clampInput(raw2);
   const dirty: number[] = [];
 
-  movePlayer(sim.p1, in1, sim.tick, config);
-  movePlayer(sim.p2, in2, sim.tick, config);
+  movePlayer(sim.p1, in1, sim.tick, config, sim.grid);
+  movePlayer(sim.p2, in2, sim.tick, config, sim.grid);
   paintAt(sim.grid, config, sim.p1.x, sim.p1.y, 1, dirty);
   paintAt(sim.grid, config, sim.p2.x, sim.p2.y, 2, dirty);
 
@@ -171,6 +180,7 @@ function movePlayer(
   input: PlayerInput,
   tick: number,
   config: GameConfig,
+  grid: Uint8Array,
 ): void {
   player.dx = input.dx;
   player.dy = input.dy;
@@ -187,12 +197,17 @@ function movePlayer(
   const dashing = tick <= player.dashUntilTick;
   const cellsPerTick =
     (config.speed / config.tickHz) * (dashing ? config.dashMul : 1);
-  player.x += nx * cellsPerTick;
-  player.y += ny * cellsPerTick;
-
-  const pad = 0.45;
-  player.x = clamp(player.x, pad, config.arenaW - pad);
-  player.y = clamp(player.y, pad, config.arenaH - pad);
+  const moved = slide(
+    grid,
+    config.arenaW,
+    config.arenaH,
+    player.x,
+    player.y,
+    nx * cellsPerTick,
+    ny * cellsPerTick,
+  );
+  player.x = moved.x;
+  player.y = moved.y;
 }
 
 export type PaintField = {
@@ -223,15 +238,11 @@ export function paintAt(
       const dy = cy - py;
       if (dx * dx + dy * dy > r2) continue;
       const i = y * w + x;
-      if (grid[i] === side) continue;
+      if (grid[i] === side || grid[i] === BLOCKED) continue;
       grid[i] = side;
       dirty.push(i);
     }
   }
-}
-
-function clamp(n: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, n));
 }
 
 export function playerOf(sim: SimState, side: Side): PlayerState {
