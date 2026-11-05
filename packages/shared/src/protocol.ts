@@ -1,6 +1,7 @@
 import { z } from 'zod';
 
 import type { ArenaConfig } from './arena-config.ts';
+import type { CardTable } from './cards.ts';
 import type { ArenaView } from './arena-sim.ts';
 import { CARD_IDS } from './cards.ts';
 import type { GameConfig } from './config.ts';
@@ -52,18 +53,22 @@ export const clientMsgSchema = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('play_cpu'),
     game: gameKindSchema.optional(),
+    deck: z.array(cardIdSchema).max(12).optional(),
   }),
   z.object({
     type: z.literal('queue'),
     game: gameKindSchema.optional(),
+    deck: z.array(cardIdSchema).max(12).optional(),
   }),
   z.object({
     type: z.literal('create_room'),
     game: gameKindSchema.optional(),
+    deck: z.array(cardIdSchema).max(12).optional(),
   }),
   z.object({
     type: z.literal('join_room'),
     code: z.string().min(4).max(8),
+    deck: z.array(cardIdSchema).max(12).optional(),
   }),
   z.object({
     type: z.literal('input'),
@@ -115,10 +120,17 @@ export type StatePayload = {
   dirty: readonly DirtyCell[];
   grid?: string;
   winner: Winner;
+  mapName: string;
 };
 
 export type ServerMsg =
-  | { type: 'welcome'; guestId: string; name: string; protocol: typeof PROTOCOL_VERSION }
+  | {
+      type: 'welcome';
+      guestId: string;
+      name: string;
+      protocol: typeof PROTOCOL_VERSION;
+      resume?: boolean;
+    }
   | { type: 'queued' }
   | { type: 'room'; code: string }
   | { type: 'waiting'; message: string }
@@ -140,6 +152,7 @@ export type ServerMsg =
       side: Side;
       names: { p1: string; p2: string };
       config: ArenaConfig;
+      cards: CardTable;
       state: ArenaView;
     }
   | { type: 'state'; game: 'spray'; state: StatePayload }

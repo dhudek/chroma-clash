@@ -1,5 +1,6 @@
 import {
   arenaConfigSchema,
+  cardTableSchema,
   gameConfigSchema,
   PROTOCOL_VERSION,
 } from '@clash/shared';
@@ -37,6 +38,7 @@ export function createApi(hub: GameHub, adminPin: string) {
         ws: '/ws',
         settings: hub.getSettings(),
         arena: hub.getArenaSettings(),
+        cards: hub.getCardTable(),
       }),
     )
     .get('/admin/settings', admin, (c) =>
@@ -61,6 +63,16 @@ export function createApi(hub: GameHub, adminPin: string) {
       (c) => {
         const settings = hub.setArenaSettings(c.req.valid('json'));
         return c.json({ settings });
+      },
+    )
+    .get('/admin/cards', admin, (c) => c.json({ cards: hub.getCardTable() }))
+    .put(
+      '/admin/cards',
+      admin,
+      zValidator('json', cardTableSchema),
+      (c) => {
+        const cards = hub.setCardTable(c.req.valid('json'));
+        return c.json({ cards });
       },
     )
     .get('/admin/matches', admin, (c) =>

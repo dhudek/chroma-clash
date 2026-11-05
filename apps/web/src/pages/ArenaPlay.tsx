@@ -1,8 +1,11 @@
 import {
   CARD_CATALOG,
+  defaultCardTable,
+  tunedCard,
   type ArenaConfig,
   type ArenaView,
   type CardId,
+  type CardTable,
   type ServerMsg,
   type Side,
 } from '@clash/shared';
@@ -12,6 +15,7 @@ import { sfxCountdown, sfxDash, sfxSpell, sfxWin, unlockAudio } from '../game/au
 import { CardArenaRenderer } from '../game/arena-renderer';
 import { CardFace } from '../game/CardFace';
 import { guestId, Net } from '../game/net';
+import { clearSeat, rememberRoom } from '../game/seat';
 import type { PlayIntent } from './Lobby';
 
 type Props = {
@@ -55,6 +59,7 @@ export function ArenaPlay({ name, intent, onExit }: Props) {
   const configRef = useRef<ArenaConfig | null>(null);
   const netRef = useRef<Net | null>(null);
   const [hud, setHud] = useState<Hud>(emptyHud);
+  const [table, setTable] = useState<CardTable>(defaultCardTable);
   const [drag, setDrag] = useState<Drag | null>(null);
   const [rtt, setRtt] = useState(0);
   const [error, setError] = useState<string | null>(null);
@@ -62,6 +67,9 @@ export function ArenaPlay({ name, intent, onExit }: Props) {
   hudRef.current = hud;
   const dragRef = useRef<Drag | null>(null);
   const floatRef = useRef<HTMLDivElement>(null);
+  const endDrag = useRef<(() => void) | null>(null);
+
+  useEffect(() => () => endDrag.current?.(), []);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -77,7 +85,11 @@ export function ArenaPlay({ name, intent, onExit }: Props) {
 
     const onResize = () => renderer.resize();
     const onEsc = (e: KeyboardEvent) => {
-      if (e.code === 'Escape') onExit();
+      if (e.code === 'Escape') {
+        clearSeat();
+        net.send({ type: 'leave' });
+        onExit();
+      }
     };
     window.addEventListener('resize', onResize);
     window.addEventListener('keydown', onEsc);
@@ -88,12 +100,20 @@ export function ArenaPlay({ name, intent, onExit }: Props) {
     net.onMessage = (msg: ServerMsg) => {
       setRtt(net.rtt);
       switch (msg.type) {
-        case 'welcome':
-          if (intent.kind === 'cpu') net.send({ type: 'play_cpu', game: 'arena' });
-          else if (intent.kind === 'queue') net.send({ type: 'queue', game: 'arena' });
-          else if (intent.kind === 'create') net.send({ type: 'create_room', game: 'arena' });
-          else net.send({ type: 'join_room', code: intent.code });
+        case 'welcome': {
+          if (msg.resume === true) break;
+          if (intent.kind === 'resume') {
+            clearSeat();
+            onExit();
+            break;
+          }
+          const deck = intent.deck;
+          if (intent.kind === 'cpu') net.send({ type: 'play_cpu', game: 'arena', deck });
+          else if (intent.kind === 'queue') net.send({ type: 'queue', game: 'arena', deck });
+          else if (intent.kind === 'create') net.send({ type: 'create_room', game: 'arena', deck });
+          else net.send({ type: 'join_room', code: intent.code, deck });
           break;
+        }
         case 'queued':
           setHud((h) => ({ ...h, waiting: 'Searching the void…' }));
           break;
@@ -101,6 +121,7 @@ export function ArenaPlay({ name, intent, onExit }: Props) {
           setHud((h) => ({ ...h, waiting: msg.message }));
           break;
         case 'room':
+          rememberRoom(msg.code);
           setHud((h) => ({
             ...h,
             room: msg.code,
@@ -114,7 +135,8 @@ export function ArenaPlay({ name, intent, onExit }: Props) {
           }
           playing = true;
           configRef.current = msg.config;
-          renderer.start(msg.config, msg.side, msg.state);
+          setTable(msg.cards);
+          renderer.start(msg.config, msg.side, msg.state, msg.cards);
           setHud({
             names: msg.names,
             side: msg.side,
@@ -144,6 +166,7 @@ export function ArenaPlay({ name, intent, onExit }: Props) {
           break;
         case 'match_end':
           playing = false;
+          clearSeat();
           setHud((h) => ({
             ...h,
             overReason: msg.reason,
@@ -165,7 +188,11 @@ export function ArenaPlay({ name, intent, onExit }: Props) {
     net.connect();
 
     const loop = (now: number) => {
-      renderer.draw(now);
+      try {
+        renderer.draw(now);
+      } catch (err) {
+        console.error(err);
+      }
       raf = requestAnimationFrame(loop);
     };
     raf = requestAnimationFrame(loop);
@@ -174,7 +201,6 @@ export function ArenaPlay({ name, intent, onExit }: Props) {
       cancelAnimationFrame(raf);
       window.removeEventListener('resize', onResize);
       window.removeEventListener('keydown', onEsc);
-      net.send({ type: 'leave' });
       net.close();
     };
   }, [intent, name]);
@@ -212,13 +238,13 @@ export function ArenaPlay({ name, intent, onExit }: Props) {
     renderer.ghost = null;
     if (world === null) return;
     if (!renderer.canDrop(cardId, world.x, world.y)) return;
-    const def = CARD_CATALOG[cardId];
-    if (def.role === 'spell') {
+    const def = tunedCard(renderer.cards, cardId);
+    if (def?.role === 'spell') {
       const rgb =
         hudRef.current.side === 1
           ? { r: 255, g: 61, b: 154 }
           : { r: 61, g: 240, b: 255 };
-      renderer.spellImpact(world.x, world.y, rgb);
+      renderer.spellImpact(world.x, world.y, rgb, def.paint, cardId);
       sfxSpell();
     } else {
       renderer.burst(world.x, world.y, { r: 61, g: 240, b: 255 }, 22);
@@ -228,42 +254,56 @@ export function ArenaPlay({ name, intent, onExit }: Props) {
   };
 
   const onCardDown = (e: React.PointerEvent<HTMLButtonElement>, id: CardId, afford: boolean) => {
-    if (!afford) return;
+    if (!afford || dragRef.current !== null) return;
+    if (hudRef.current.view?.phase !== 'play') return;
     e.preventDefault();
-    e.currentTarget.setPointerCapture(e.pointerId);
+    const pointerId = e.pointerId;
+    const originX = e.clientX;
+    const originY = e.clientY;
     const next: Drag = {
       cardId: id,
-      x: e.clientX,
-      y: e.clientY,
-      fromX: e.clientX,
-      fromY: e.clientY,
+      x: originX,
+      y: originY,
+      fromX: originX,
+      fromY: originY,
       ok: false,
     };
     dragRef.current = next;
     setDrag(next);
-    requestAnimationFrame(() => placeFloat(e.clientX, e.clientY, false));
-    syncGhost(id, e.clientX, e.clientY);
-  };
+    requestAnimationFrame(() => placeFloat(originX, originY, false));
+    syncGhost(id, originX, originY);
 
-  const onCardMove = (e: React.PointerEvent<HTMLButtonElement>) => {
-    const current = dragRef.current;
-    if (current === null) return;
-    const ok = syncGhost(current.cardId, e.clientX, e.clientY);
-    current.x = e.clientX;
-    current.y = e.clientY;
-    current.ok = ok;
-    placeFloat(e.clientX, e.clientY, ok);
-  };
-
-  const onCardUp = (e: React.PointerEvent<HTMLButtonElement>) => {
-    const current = dragRef.current;
-    dragRef.current = null;
-    setDrag(null);
-    if (rendererRef.current !== null) rendererRef.current.ghost = null;
-    if (current === null) return;
-    const dist = Math.hypot(e.clientX - current.fromX, e.clientY - current.fromY);
-    if (dist < 14) return;
-    drop(current.cardId, e.clientX, e.clientY);
+    const move = (ev: PointerEvent) => {
+      if (ev.pointerId !== pointerId || dragRef.current === null) return;
+      const ok = syncGhost(id, ev.clientX, ev.clientY);
+      dragRef.current.x = ev.clientX;
+      dragRef.current.y = ev.clientY;
+      dragRef.current.ok = ok;
+      placeFloat(ev.clientX, ev.clientY, ok);
+    };
+    const finish = (ev: PointerEvent) => {
+      if (ev.pointerId !== pointerId) return;
+      stop();
+      const current = dragRef.current;
+      dragRef.current = null;
+      setDrag(null);
+      if (rendererRef.current !== null) rendererRef.current.ghost = null;
+      if (current === null || ev.type === 'pointercancel') return;
+      const dist = Math.hypot(ev.clientX - originX, ev.clientY - originY);
+      if (dist < 14) return;
+      drop(id, ev.clientX, ev.clientY);
+    };
+    const stop = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', finish);
+      window.removeEventListener('pointercancel', finish);
+      if (endDrag.current === stop) endDrag.current = null;
+    };
+    endDrag.current?.();
+    endDrag.current = stop;
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', finish);
+    window.addEventListener('pointercancel', finish);
   };
 
   const view = hud.view;
@@ -273,7 +313,8 @@ export function ArenaPlay({ name, intent, onExit }: Props) {
     view !== null && view.phase === 'countdown' && hud.waiting === null && view.countdownLeft > 0;
   const energy = view?.energy ?? 0;
   const energyMax = view?.energyMax ?? 10;
-  const dragHint = hintFor(drag, energy);
+  const wholeEnergy = Math.max(0, Math.floor(Number.isFinite(energy) ? energy : 0));
+  const dragHint = hintFor(drag, energy, table);
 
   return (
     <div className="stage arena-stage">
@@ -282,6 +323,7 @@ export function ArenaPlay({ name, intent, onExit }: Props) {
         <div className="hud-top">
           <TowerStrip view={view} side={hud.side} you />
           <div className="timer-wrap">
+            <div className="map-name">{view?.mapName ?? ''}</div>
             <div className="timer">{fmtTime(view?.timeLeft ?? 0)}</div>
             <div className="hint-banner">{dragHint}</div>
           </div>
@@ -293,34 +335,31 @@ export function ArenaPlay({ name, intent, onExit }: Props) {
         </div>
         <div className="card-dock">
           <div className="energy">
-            <span className="energy-label">ENERGY</span>
+            <span className="energy-label">ARROWS</span>
             <b>
-              {Math.floor(energy)}
+              {wholeEnergy}
               <small>/{Math.round(energyMax)}</small>
             </b>
             <div className="energy-pips">
               {Array.from({ length: Math.round(energyMax) }, (_, i) => (
-                <i key={i} className={i < energy ? 'on' : ''} />
+                <i key={i} className={i < wholeEnergy ? 'on' : ''} />
               ))}
             </div>
           </div>
           <div className="hand">
             {(view?.hand ?? []).map((id, i) => {
-              const def = CARD_CATALOG[id];
+              const def = tunedCard(table, id) ?? CARD_CATALOG[id];
               const afford = energy + 1e-6 >= def.cost;
               const lifting = drag?.cardId === id;
               return (
                 <button
                   key={`${id}-${i}`}
                   type="button"
-                  className={`card ${afford ? '' : 'dim'} ${lifting ? 'lifting' : ''} ${def.role === 'spell' ? 'spell' : ''}`}
+                  className={`card span-${def.span} ${cardMotion(def.role)} ${afford ? '' : 'dim'} ${lifting ? 'lifting' : ''}`}
                   style={{ touchAction: 'none' }}
                   onPointerDown={(e) => onCardDown(e, id, afford)}
-                  onPointerMove={onCardMove}
-                  onPointerUp={onCardUp}
-                  onPointerCancel={onCardUp}
                 >
-                  <CardFace id={id} />
+                  <CardFace id={id} tune={table[id]} />
                   {afford ? null : (
                     <span className="need">need {Math.ceil(def.cost - energy)}</span>
                   )}
@@ -328,16 +367,16 @@ export function ArenaPlay({ name, intent, onExit }: Props) {
               );
             })}
             {view?.next !== undefined && view.next !== null ? (
-              <div className="card next">
-                <CardFace id={view.next} compact />
+              <div className={`card next span-${(tunedCard(table, view.next) ?? CARD_CATALOG[view.next]).span} ${cardMotion(CARD_CATALOG[view.next].role)}`}>
+                <CardFace id={view.next} compact tune={table[view.next]} />
               </div>
             ) : null}
           </div>
         </div>
       </div>
       {drag !== null ? (
-        <div ref={floatRef} className="card-float">
-          <CardFace id={drag.cardId} />
+        <div ref={floatRef} className={`card-float span-${(tunedCard(table, drag.cardId) ?? CARD_CATALOG[drag.cardId]).span}`}>
+          <CardFace id={drag.cardId} tune={table[drag.cardId]} />
         </div>
       ) : null}
       {hud.waiting !== null && hud.overReason === null && error === null && (
@@ -346,7 +385,15 @@ export function ArenaPlay({ name, intent, onExit }: Props) {
             <p className="eyebrow">arena</p>
             <h2>{hud.room ?? 'WAIT'}</h2>
             <p>{hud.waiting}</p>
-            <button className="btn btn-ghost" type="button" onClick={onExit}>
+            <button
+              className="btn btn-ghost"
+              type="button"
+              onClick={() => {
+                clearSeat();
+                netRef.current?.send({ type: 'leave' });
+                onExit();
+              }}
+            >
               Leave
             </button>
           </div>
@@ -355,7 +402,6 @@ export function ArenaPlay({ name, intent, onExit }: Props) {
       {showCountdown && view !== null && (
         <div className="overlay overlay-count">
           <h2>{Math.max(1, Math.ceil(view.countdownLeft))}</h2>
-          <p>paint the whole map your color · drop on YOUR squares</p>
         </div>
       )}
       {hud.overReason !== null && (
@@ -364,7 +410,15 @@ export function ArenaPlay({ name, intent, onExit }: Props) {
             <p className="eyebrow">{hud.overReason}</p>
             <h2>{hud.winner === 0 ? 'DRAW' : youWin ? 'WIN' : 'LOSS'}</h2>
             <p>paint won the map</p>
-            <button className="btn btn-cyan" type="button" onClick={onExit}>
+            <button
+              className="btn btn-cyan"
+              type="button"
+              onClick={() => {
+                clearSeat();
+                netRef.current?.send({ type: 'leave' });
+                onExit();
+              }}
+            >
               Back
             </button>
           </div>
@@ -375,7 +429,15 @@ export function ArenaPlay({ name, intent, onExit }: Props) {
           <div>
             <h2>DROP</h2>
             <p>{error}</p>
-            <button className="btn btn-ghost" type="button" onClick={onExit}>
+            <button
+              className="btn btn-ghost"
+              type="button"
+              onClick={() => {
+                clearSeat();
+                netRef.current?.send({ type: 'leave' });
+                onExit();
+              }}
+            >
               Back
             </button>
           </div>
@@ -385,14 +447,20 @@ export function ArenaPlay({ name, intent, onExit }: Props) {
   );
 }
 
-function hintFor(drag: Drag | null, energy: number): string {
-  if (drag === null) return 'Drag onto YOUR color · Meteor anywhere';
-  const def = CARD_CATALOG[drag.cardId];
-  if (energy + 1e-6 < def.cost) return `Need ${def.cost} energy`;
-  if (def.role === 'spell') {
-    return drag.ok ? 'Release Meteor — converts anywhere' : 'Aim Meteor on the field';
-  }
-  return drag.ok ? `Release — deploy ${def.name} on your color` : 'Only on YOUR color';
+function cardMotion(role: string): string {
+  if (role === 'building') return 'kind-tower';
+  if (role === 'flying') return 'kind-flier';
+  if (role === 'spell') return 'kind-spell';
+  return 'kind-move';
+}
+
+function hintFor(drag: Drag | null, energy: number, table: CardTable): string {
+  if (drag === null) return '';
+  const def = tunedCard(table, drag.cardId) ?? CARD_CATALOG[drag.cardId];
+  if (energy + 1e-6 < def.cost) return `Need ${def.cost}`;
+  if (drag.ok) return '';
+  if (def.role === 'spell') return 'Needs open ground';
+  return def.span > 1 ? `Needs a ${def.span}×${def.span} of your color` : 'Needs your color';
 }
 
 function TowerStrip({
@@ -408,6 +476,19 @@ function TowerStrip({
   const king = towers.find((t) => t.slot === 'king');
   const left = towers.find((t) => t.slot === 'left');
   const right = towers.find((t) => t.slot === 'right');
+  if (towers.length === 0) {
+    const scores = view?.scores;
+    const mine = side === 1 ? (scores?.p1 ?? 0) : (scores?.p2 ?? 0);
+    const other = side === 1 ? (scores?.p2 ?? 0) : (scores?.p1 ?? 0);
+    const painted = mine + other;
+    const pct = painted === 0 ? 0 : Math.round((mine / painted) * 100);
+    return (
+      <div className={`tower-strip ${you ? 'you' : 'them'} side-${side}`}>
+        <span className="strip-name">{you ? 'YOU' : 'ENEMY'}</span>
+        <b className="paint-pct">{pct}%</b>
+      </div>
+    );
+  }
   return (
     <div className={`tower-strip ${you ? 'you' : 'them'} side-${side}`}>
       <span className="strip-name">{you ? 'YOU' : 'ENEMY'}</span>
@@ -425,12 +506,12 @@ function Pip({
   t: { hp: number; maxHp: number; active: boolean } | undefined;
   king?: boolean;
 }) {
-  const pct = t === undefined ? 0 : Math.max(0, t.hp / t.maxHp);
+  const pct = t === undefined || t.maxHp <= 0 ? 0 : Math.max(0, t.hp / t.maxHp);
   const dead = t !== undefined && t.hp <= 0;
   const asleep = king && t !== undefined && !t.active && t.hp > 0;
   return (
     <span className={`pip ${king ? 'king' : ''} ${dead ? 'dead' : ''} ${asleep ? 'asleep' : ''}`}>
-      <i style={{ height: `${pct * 100}%` }} />
+      {pct > 0 ? <i style={{ height: `${pct * 100}%` }} /> : null}
     </span>
   );
 }

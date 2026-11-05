@@ -111,6 +111,7 @@ function payloadFrom(
     scores: countScores(sim.grid),
     dirty,
     winner: sim.winner,
+    mapName: sim.mapName,
   };
   if (full) state.grid = encodeGrid(sim.grid);
   return state;

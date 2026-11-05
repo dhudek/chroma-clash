@@ -2,11 +2,15 @@ import {
   CARD_CATALOG,
   canDropAt,
   decodeGrid,
+  defaultCardTable,
+  footprintOf,
+  tunedCard,
   viewToWorld,
   worldToView,
   type ArenaConfig,
   type ArenaView,
   type CardId,
+  type CardTable,
   type Side,
   type TowerView,
   type UnitView,
@@ -14,6 +18,14 @@ import {
 
 const MAGENTA = { r: 255, g: 61, b: 154 };
 const CYAN = { r: 61, g: 240, b: 255 };
+
+function figureHeight(cardId: CardId, role: string, cell: number): number {
+  if (role === 'building') return cell * (cardId === 'spire' ? 3.15 : 2.85);
+  if (cardId === 'brute') return cell * 3.2;
+  if (cardId === 'swarm') return cell * 1.9;
+  if (role === 'flying') return cell * 2.65;
+  return cell * 2.55;
+}
 
 type Rgb = { r: number; g: number; b: number };
 
@@ -32,9 +44,15 @@ type SmoothUnit = {
   id: number;
   x: number;
   y: number;
+  px: number;
+  py: number;
   tx: number;
   ty: number;
-  facing: number;
+  t0: number;
+  span: number;
+  faceSign: number;
+  pendingFace: number;
+  faceStreak: number;
   born: number;
 };
 
@@ -44,6 +62,7 @@ export class CardArenaRenderer {
   private paint: HTMLCanvasElement;
   private pctx: CanvasRenderingContext2D;
   private grid: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+  cards: CardTable = defaultCardTable();
   private config: ArenaConfig | null = null;
   private side: Side = 1;
   private view: ArenaView | null = null;
@@ -55,6 +74,9 @@ export class CardArenaRenderer {
   private smooth = new Map<number, SmoothUnit>();
   private knownUnits = new Set<number>();
   private knownShots = new Set<number>();
+  private shotPrev = new Map<number, { x: number; y: number }>();
+  private swings = new Map<number, { swing: number; t0: number }>();
+  private casts: { x: number; y: number; born: number; cardId: CardId }[] = [];
   private stars: { x: number; y: number; z: number; s: number }[] = [];
 
   constructor(canvas: HTMLCanvasElement) {
@@ -74,9 +96,11 @@ export class CardArenaRenderer {
         s: 0.4 + Math.random() * 1.4,
       });
     }
+    loadAnim();
   }
 
-  start(config: ArenaConfig, side: Side, view: ArenaView): void {
+  start(config: ArenaConfig, side: Side, view: ArenaView, cards?: CardTable): void {
+    this.cards = cards ?? defaultCardTable();
     this.config = config;
     this.side = side;
     this.grid = new Uint8Array(config.arenaW * config.arenaH);
@@ -89,6 +113,8 @@ export class CardArenaRenderer {
     this.knownShots.clear();
     this.sparks = [];
     this.rings = [];
+    this.casts = [];
+    this.swings.clear();
     this.flashes.clear();
     this.resize();
     this.rebuildPaint();
@@ -149,11 +175,14 @@ export class CardArenaRenderer {
   canDrop(cardId: CardId, x: number, y: number): boolean {
     const cfg = this.config;
     if (cfg === null) return false;
-    return canDropAt(this.grid, cfg, this.side, cardId, x, y);
+    return canDropAt(this.grid, cfg, this.side, cardId, x, y, this.cards);
   }
 
-  spellImpact(x: number, y: number, rgb: Rgb): void {
-    this.rings.push({ x, y, born: performance.now(), rgb, max: 3.4 });
+  spellImpact(x: number, y: number, rgb: Rgb, radius = 3.4, cardId: CardId = 'meteor'): void {
+    // born is anchored on the next draw. performance.now() can sit ahead of the
+    // rAF timestamp and produce a negative radius, which makes arc() throw.
+    this.rings.push({ x, y, born: -1, rgb, max: radius });
+    this.casts.push({ x, y, born: -1, cardId });
     this.burst(x, y, rgb, 28);
   }
 
@@ -188,13 +217,12 @@ export class CardArenaRenderer {
     ctx.globalAlpha = 0.92;
     ctx.drawImage(this.paint, 0, 0, cfg.arenaW * layout.cell, cfg.arenaH * layout.cell);
     ctx.globalAlpha = 1;
-    this.drawRiver(cfg, now);
-    this.drawLaneLabels(cfg, now);
     if (this.ghost !== null) this.drawDeployZone(cfg, now);
-    this.stepSmooth(0.22);
+    this.advanceSmooth(now);
     if (this.ghost !== null) this.drawGhost(cfg, this.ghost, now);
     for (const t of view.towers) this.drawTower(cfg, t, now);
     for (const u of view.units) this.drawUnit(cfg, u, now);
+    this.drawCasts(cfg, now);
     for (const p of view.projectiles) this.drawShot(p, now);
     this.drawRings(now);
     this.drawSparks(now);
@@ -208,22 +236,51 @@ export class CardArenaRenderer {
       seen.add(u.id);
       const prev = this.smooth.get(u.id);
       if (prev === undefined) {
+        const now = performance.now();
         this.smooth.set(u.id, {
           id: u.id,
           x: u.x,
           y: u.y,
+          px: u.x,
+          py: u.y,
           tx: u.x,
           ty: u.y,
-          facing: u.side === 1 ? -Math.PI / 2 : Math.PI / 2,
-          born: performance.now(),
+          t0: now,
+          span: 50,
+          faceSign: 1,
+          pendingFace: 1,
+          faceStreak: 0,
+          born: now,
         });
         if (!first) this.burst(u.x, u.y, u.side === 1 ? MAGENTA : CYAN, 18);
       } else {
-        const dx = u.x - prev.tx;
-        const dy = u.y - prev.ty;
-        if (dx * dx + dy * dy > 0.0004) prev.facing = Math.atan2(dy, dx);
+        const now = performance.now();
+        const along = prev.span <= 0 ? 1 : Math.min(1, (now - prev.t0) / prev.span);
+        const rx = prev.px + (prev.tx - prev.px) * along;
+        const ry = prev.py + (prev.ty - prev.py) * along;
+        const cfg = this.config;
+        if (cfg !== null) {
+          const from = worldToView(this.side, prev.tx, prev.ty, cfg.arenaW, cfg.arenaH);
+          const to = worldToView(this.side, u.x, u.y, cfg.arenaW, cfg.arenaH);
+          const sdx = to.x - from.x;
+          const sdy = to.y - from.y;
+          if (Math.abs(sdx) > 0.05 && Math.abs(sdx) > Math.abs(sdy) * 0.45) {
+            const want = sdx < 0 ? -1 : 1;
+            if (want === prev.pendingFace) prev.faceStreak += 1;
+            else {
+              prev.pendingFace = want;
+              prev.faceStreak = 1;
+            }
+            if (prev.faceStreak >= 2) prev.faceSign = want;
+          }
+        }
+        const measured = now - prev.t0;
+        prev.px = rx;
+        prev.py = ry;
         prev.tx = u.x;
         prev.ty = u.y;
+        prev.t0 = now;
+        prev.span = measured >= 16 && measured <= 200 ? measured : 50;
       }
     }
     for (const [id, s] of this.smooth) {
@@ -251,13 +308,17 @@ export class CardArenaRenderer {
       }
     }
     this.knownShots = shots;
+    for (const id of this.shotPrev.keys()) {
+      if (!shots.has(id)) this.shotPrev.delete(id);
+    }
     this.knownUnits = seen;
   }
 
-  private stepSmooth(k: number): void {
+  private advanceSmooth(now: number): void {
     for (const s of this.smooth.values()) {
-      s.x += (s.tx - s.x) * k;
-      s.y += (s.ty - s.y) * k;
+      const t = s.span <= 0 ? 1 : Math.min(1, (now - s.t0) / s.span);
+      s.x = s.px + (s.tx - s.px) * t;
+      s.y = s.py + (s.ty - s.py) * t;
     }
   }
 
@@ -325,100 +386,51 @@ export class CardArenaRenderer {
     ctx.beginPath();
     ctx.roundRect(-6, -6, w + 12, h + 12, 18);
     ctx.fill();
-    ctx.strokeStyle = 'rgba(255,255,255,0.045)';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    for (let x = 0; x <= cfg.arenaW; x += 1) {
-      ctx.moveTo(x * layout.cell, 0);
-      ctx.lineTo(x * layout.cell, h);
-    }
-    for (let y = 0; y <= cfg.arenaH; y += 1) {
-      ctx.moveTo(0, y * layout.cell);
-      ctx.lineTo(w, y * layout.cell);
-    }
-    ctx.stroke();
-    const pulse = 0.04 + Math.sin(now / 700) * 0.02;
-    ctx.fillStyle = `rgba(255,61,154,${pulse})`;
-    const ownTop = this.side === 1;
-    ctx.fillRect(0, ownTop ? h / 2 : 0, w, h / 2);
-    ctx.fillStyle = `rgba(61,240,255,${pulse})`;
-    ctx.fillRect(0, ownTop ? 0 : h / 2, w, h / 2);
-  }
-
-  private drawRiver(cfg: ArenaConfig, now: number): void {
-    const { ctx, layout } = this;
-    const y = worldToView(this.side, 0, cfg.arenaH / 2, cfg.arenaW, cfg.arenaH).y * layout.cell;
-    const w = cfg.arenaW * layout.cell;
-    const g = ctx.createLinearGradient(0, y - 10, 0, y + 10);
-    g.addColorStop(0, 'rgba(255,255,255,0)');
-    g.addColorStop(0.5, `rgba(180,220,255,${0.22 + Math.sin(now / 400) * 0.08})`);
-    g.addColorStop(1, 'rgba(255,255,255,0)');
-    ctx.fillStyle = g;
-    ctx.fillRect(0, y - 10, w, 20);
-    ctx.strokeStyle = 'rgba(255,255,255,0.55)';
-    ctx.setLineDash([10, 12]);
-    ctx.lineDashOffset = -now / 40;
-    ctx.beginPath();
-    ctx.moveTo(0, y);
-    ctx.lineTo(w, y);
-    ctx.stroke();
-    ctx.setLineDash([]);
-  }
-
-  private drawLaneLabels(cfg: ArenaConfig, now: number): void {
-    const { ctx, layout } = this;
-    const w = cfg.arenaW * layout.cell;
-    const h = cfg.arenaH * layout.cell;
-    const pulse = 0.45 + Math.sin(now / 500) * 0.12;
-    ctx.save();
-    ctx.textAlign = 'center';
-    ctx.font = `800 ${Math.max(18, layout.cell * 0.95)}px Syne, sans-serif`;
-    ctx.fillStyle = `rgba(255,255,255,${0.18 + pulse * 0.12})`;
-    ctx.fillText('THEM', w / 2, h * 0.16);
-    ctx.fillStyle = `rgba(255,255,255,${0.28 + pulse * 0.2})`;
-    ctx.fillText('YOU', w / 2, h * 0.86);
-    ctx.font = `600 ${Math.max(11, layout.cell * 0.42)}px Outfit, sans-serif`;
-    ctx.fillStyle = 'rgba(255,255,255,0.32)';
-    ctx.fillText('drop on YOUR color · Meteor anywhere · paint the map', w / 2, h * 0.9);
-    ctx.restore();
+    void now;
   }
 
   private drawDeployZone(cfg: ArenaConfig, now: number): void {
     if (this.ghost === null) return;
     const { ctx, layout } = this;
-    const w = cfg.arenaW * layout.cell;
-    const h = cfg.arenaH * layout.cell;
-    const spell = CARD_CATALOG[this.ghost.cardId].role === 'spell';
+    const cell = layout.cell;
     ctx.save();
-    if (spell) {
-      ctx.globalAlpha = 0.1 + Math.sin(now / 160) * 0.04;
-      ctx.fillStyle = this.ghost.ok ? '#ff3d9a' : '#ff4d6d';
-      ctx.fillRect(0, 0, w, h);
-    } else {
-      const cell = layout.cell;
-      ctx.globalAlpha = 0.18 + Math.sin(now / 180) * 0.05;
-      ctx.fillStyle = '#3df0ff';
-      for (let i = 0; i < this.grid.length; i += 1) {
-        if (this.grid[i] !== this.side) continue;
-        const gx = i % cfg.arenaW;
-        const gy = Math.floor(i / cfg.arenaW);
-        const v = worldToView(this.side, gx + 0.5, gy + 0.5, cfg.arenaW, cfg.arenaH);
-        ctx.fillRect((v.x - 0.5) * cell, (v.y - 0.5) * cell, cell, cell);
-      }
+    ctx.globalAlpha = 0.18 + Math.sin(now / 180) * 0.05;
+    ctx.fillStyle = this.side === 1 ? '#ff3d9a' : '#3df0ff';
+    for (let i = 0; i < this.grid.length; i += 1) {
+      if (this.grid[i] !== this.side) continue;
+      const gx = i % cfg.arenaW;
+      const gy = Math.floor(i / cfg.arenaW);
+      const v = worldToView(this.side, gx + 0.5, gy + 0.5, cfg.arenaW, cfg.arenaH);
+      ctx.fillRect((v.x - 0.5) * cell, (v.y - 0.5) * cell, cell, cell);
     }
     ctx.restore();
+  }
+
+  private drawFootprint(
+    cfg: ArenaConfig,
+    x: number,
+    y: number,
+    span: number,
+    ok: boolean,
+    now: number,
+  ): void {
+    const { ctx, layout } = this;
+    const box = footprintOf(x, y, span);
+    const a = worldToView(this.side, box.x0, box.y0, cfg.arenaW, cfg.arenaH);
+    const b = worldToView(this.side, box.x1, box.y1, cfg.arenaW, cfg.arenaH);
+    const left = Math.min(a.x, b.x) * layout.cell;
+    const top = Math.min(a.y, b.y) * layout.cell;
+    const rw = Math.abs(b.x - a.x) * layout.cell;
+    const rh = Math.abs(b.y - a.y) * layout.cell;
+    const col = ok ? '61,240,255' : '255,80,110';
     ctx.save();
-    ctx.textAlign = 'center';
-    ctx.font = `800 ${Math.max(14, layout.cell * 0.7)}px Outfit, sans-serif`;
-    ctx.fillStyle = this.ghost.ok ? 'rgba(232,255,255,0.9)' : 'rgba(255,200,210,0.9)';
-    const label = spell
-      ? this.ghost.ok
-        ? 'RELEASE METEOR'
-        : 'AIM METEOR'
-      : this.ghost.ok
-        ? 'RELEASE ON YOUR COLOR'
-        : 'ONLY ON YOUR COLOR';
-    ctx.fillText(label, w / 2, h * 0.5);
+    ctx.fillStyle = `rgba(${col},0.22)`;
+    ctx.strokeStyle = `rgba(${col},0.95)`;
+    ctx.lineWidth = 2;
+    ctx.setLineDash([6, 6]);
+    ctx.lineDashOffset = -now / 30;
+    ctx.fillRect(left, top, rw, rh);
+    ctx.strokeRect(left, top, rw, rh);
     ctx.restore();
   }
 
@@ -429,31 +441,25 @@ export class CardArenaRenderer {
   ): void {
     const { ctx, layout } = this;
     const c = this.toScreen(ghost.x, ghost.y);
-    const def = CARD_CATALOG[ghost.cardId];
+    const def = tunedCard(this.cards, ghost.cardId) ?? CARD_CATALOG[ghost.cardId];
     const ok = ghost.ok;
     const col = ok ? '61,240,255' : '255,80,110';
+    if (def.role !== 'spell') this.drawFootprint(cfg, ghost.x, ghost.y, def.span, ok, now);
     if (def.role === 'spell') {
-      const paintR = def.paint * layout.cell;
+      const paintR = def.paint * layout.cell * (1 + Math.sin(now / 110) * 0.06);
       const dmgR = def.range * layout.cell;
-      const beat = 1 + Math.sin(now / 110) * 0.06;
       ctx.save();
       ctx.globalCompositeOperation = 'lighter';
       ctx.fillStyle = `rgba(${col},0.16)`;
-      ctx.beginPath();
-      ctx.arc(c.x, c.y, paintR * beat, 0, Math.PI * 2);
-      ctx.fill();
       ctx.strokeStyle = `rgba(${col},0.95)`;
       ctx.lineWidth = 2.5;
       ctx.setLineDash([8, 7]);
       ctx.lineDashOffset = -now / 25;
-      ctx.beginPath();
-      ctx.arc(c.x, c.y, paintR * beat, 0, Math.PI * 2);
-      ctx.stroke();
+      if (fillCircle(ctx, c.x, c.y, paintR)) ctx.fill();
+      if (fillCircle(ctx, c.x, c.y, paintR)) ctx.stroke();
       ctx.setLineDash([3, 6]);
       ctx.lineWidth = 1.5;
-      ctx.beginPath();
-      ctx.arc(c.x, c.y, dmgR, 0, Math.PI * 2);
-      ctx.stroke();
+      if (fillCircle(ctx, c.x, c.y, dmgR)) ctx.stroke();
       ctx.setLineDash([]);
       ctx.beginPath();
       ctx.moveTo(c.x - 10, c.y);
@@ -462,33 +468,26 @@ export class CardArenaRenderer {
       ctx.lineTo(c.x, c.y + 10);
       ctx.stroke();
       ctx.restore();
-      ctx.fillStyle = ok ? '#ffe6f6' : '#ffd0d8';
-      ctx.font = `800 ${Math.max(13, layout.cell * 0.62)}px Outfit, sans-serif`;
-      ctx.textAlign = 'center';
-      ctx.fillText('METEOR', c.x, c.y - paintR - 12);
-      ctx.font = `600 ${Math.max(10, layout.cell * 0.42)}px Outfit, sans-serif`;
-      ctx.fillText('converts this crater', c.x, c.y - paintR + 6);
-      return;
     }
-    const beat = 1 + Math.sin(now / 120) * 0.08;
-    const r = layout.cell * (def.role === 'building' ? 1.45 : 1.05) * beat;
-    ctx.save();
-    ctx.fillStyle = `rgba(${col},0.18)`;
-    ctx.strokeStyle = `rgba(${col},0.95)`;
-    ctx.lineWidth = 2;
-    ctx.setLineDash([6, 6]);
-    ctx.lineDashOffset = -now / 30;
-    ctx.beginPath();
-    if (def.role === 'building') ctx.roundRect(c.x - r, c.y - r, r * 2, r * 2, 6);
-    else ctx.arc(c.x, c.y, r, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.stroke();
-    ctx.setLineDash([]);
-    ctx.restore();
-    ctx.fillStyle = ok ? '#e8ffff' : '#ffd0d8';
-    ctx.font = `700 ${Math.max(12, layout.cell * 0.55)}px Outfit, sans-serif`;
-    ctx.textAlign = 'center';
-    ctx.fillText(def.name, c.x, c.y - r - 10);
+    const planted = def.role === 'building';
+    const flying = def.role === 'flying';
+    const bob =
+      planted || def.role === 'spell'
+        ? 0
+        : Math.sin(now / 280) * layout.cell * (flying ? 0.08 : 0.04);
+    const casting =
+      def.role === 'spell' ? blendClip(ghost.cardId, 'attack', now / 90, true) : null;
+    const portrait = casting?.front ?? cardPortrait(ghost.cardId);
+    if (portrait.complete && portrait.naturalWidth > 0) {
+      const fill = casting === null ? 1 : bodyFill(ghost.cardId);
+      const bodyH = figureHeight(ghost.cardId, def.role, layout.cell) / fill;
+      const bodyW = bodyH * (portrait.naturalWidth / portrait.naturalHeight);
+      ctx.save();
+      ctx.globalAlpha = ok ? 0.94 : 0.5;
+      ctx.translate(c.x, c.y + layout.cell * 0.08 - bob);
+      this.drawSprite(portrait, casting?.back ?? null, casting?.mix ?? 0, bodyW, bodyH);
+      ctx.restore();
+    }
     void cfg;
   }
 
@@ -524,13 +523,6 @@ export class CardArenaRenderer {
     if (king) this.drawKeep(c.x, c.y, cell, rgb, dead, t.active, flash);
     else this.drawCannon(c.x, c.y, cell, rgb, dead, towardEnemy, flash);
     ctx.restore();
-    const hp = Math.max(0, t.hp);
-    ctx.font = `700 ${Math.max(10, cell * 0.42)}px IBM Plex Mono, monospace`;
-    ctx.textAlign = 'center';
-    ctx.fillStyle = dead ? 'rgba(255,255,255,0.35)' : '#fff';
-    const tag = king ? 'KEEP' : 'CANNON';
-    ctx.fillText(dead ? 'RUIN' : tag, c.x, c.y + cell * (king ? 1.85 : 1.55));
-    ctx.fillText(`${Math.ceil(hp)}`, c.x, c.y + cell * (king ? 2.25 : 1.95));
     this.hpRing(c.x, c.y, cell * (king ? 1.7 : 1.25), t.hp / t.maxHp, rgb);
   }
 
@@ -629,23 +621,57 @@ export class CardArenaRenderer {
     for (let i = this.rings.length - 1; i >= 0; i -= 1) {
       const r = this.rings[i];
       if (r === undefined) continue;
+      if (r.born < 0) r.born = now;
       const t = (now - r.born) / 420;
+      if (!(t >= 0)) continue;
       if (t >= 1) {
         this.rings.splice(i, 1);
         continue;
       }
       const c = this.toScreen(r.x, r.y);
       const rad = r.max * layout.cell * t;
-      ctx.strokeStyle = `rgba(${r.rgb.r},${r.rgb.g},${r.rgb.b},${1 - t})`;
-      ctx.lineWidth = 4 * (1 - t);
-      ctx.beginPath();
-      ctx.arc(c.x, c.y, rad, 0, Math.PI * 2);
-      ctx.stroke();
+      const width = 4 * (1 - t);
+      if (!(rad > 0) || !(width > 0)) continue;
+      ctx.strokeStyle = `rgba(${r.rgb.r},${r.rgb.g},${r.rgb.b},${Math.max(0, 1 - t)})`;
+      ctx.lineWidth = width;
+      if (fillCircle(ctx, c.x, c.y, rad)) ctx.stroke();
     }
     ctx.restore();
   }
 
+  private drawCasts(cfg: ArenaConfig, now: number): void {
+    const { ctx, layout } = this;
+    for (let i = this.casts.length - 1; i >= 0; i -= 1) {
+      const cast = this.casts[i];
+      if (cast === undefined) continue;
+      if (cast.born < 0) cast.born = now;
+      const frames = clipFrames(cast.cardId, 'attack');
+      const frameMs = 90;
+      const dur = Math.max(frameMs, Math.max(0, frames.length - 1) * frameMs);
+      const elapsed = now - cast.born;
+      if (elapsed >= dur) {
+        this.casts.splice(i, 1);
+        continue;
+      }
+      const pose = blendAt(frames, elapsed / frameMs, false);
+      const front = pose?.front ?? cardPortrait(cast.cardId);
+      if (!front.complete || front.naturalWidth <= 0) continue;
+      const c = this.toScreen(cast.x, cast.y);
+      const fill = pose === null ? 1 : bodyFill(cast.cardId);
+      const bodyH = figureHeight(cast.cardId, 'spell', layout.cell) / fill;
+      const bodyW = bodyH * (front.naturalWidth / front.naturalHeight);
+      const alpha = elapsed > dur * 0.72 ? Math.max(0, 1 - (elapsed - dur * 0.72) / (dur * 0.28)) : 0.96;
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.translate(c.x, c.y + layout.cell * 0.08);
+      this.drawSprite(front, pose?.back ?? null, pose?.mix ?? 0, bodyW, bodyH);
+      ctx.restore();
+    }
+    void cfg;
+  }
+
   private drawUnit(cfg: ArenaConfig, u: UnitView, now: number): void {
+    void cfg;
     const { ctx, layout } = this;
     const sm = this.smooth.get(u.id);
     const x = sm?.x ?? u.x;
@@ -654,51 +680,161 @@ export class CardArenaRenderer {
     const rgb = u.side === 1 ? MAGENTA : CYAN;
     const born = sm?.born ?? now;
     const pop = Math.min(1, (now - born) / 220);
-    const walk = Math.sin(now / 90 + u.id) * layout.cell * 0.06;
-    const facing = sm?.facing ?? 0;
+    const planted = u.role === 'building';
     const flying = u.role === 'flying';
-    const air = flying ? layout.cell * 0.9 : 0;
-    const base =
-      layout.cell *
-      (u.role === 'building'
-        ? u.cardId === 'spire'
-          ? 0.7
-          : 0.78
-        : u.cardId === 'brute'
-          ? 0.7
-          : u.cardId === 'swarm'
-            ? 0.32
-            : flying
-              ? 0.5
-              : 0.46);
-    const r = base * (0.7 + 0.3 * pop);
-    if (flying) {
-      ctx.fillStyle = 'rgba(0,0,0,0.28)';
+    const leg = sm === undefined ? 0 : Math.hypot(sm.tx - sm.px, sm.ty - sm.py);
+    const moving = !planted && leg > 0.02;
+    const pose = this.unitPose(u, now, moving, flying, planted);
+    const portrait = pose.front;
+    const posed = portrait !== cardPortrait(u.cardId);
+    const phase = now / (moving ? 160 : flying ? 420 : 700) + u.id;
+    const stride = Math.sin(phase);
+    const bob =
+      posed || planted
+        ? 0
+        : flying
+          ? stride * layout.cell * 0.1
+          : moving
+            ? Math.abs(stride) * layout.cell * 0.06
+            : stride * layout.cell * 0.02;
+    const air = flying && !posed ? layout.cell * 0.42 : flying ? layout.cell * 0.16 : 0;
+    const ground = c.y + layout.cell * 0.08;
+    const fill = posed ? bodyFill(u.cardId) : 1;
+    const bodyH =
+      (portrait.complete && portrait.naturalWidth > 0
+        ? figureHeight(u.cardId, u.role, layout.cell) / fill
+        : layout.cell * 1.4) *
+      (0.78 + 0.22 * pop);
+    const bodyW =
+      portrait.complete && portrait.naturalHeight > 0
+        ? bodyH * (portrait.naturalWidth / portrait.naturalHeight)
+        : bodyH * 0.45;
+    ctx.fillStyle = 'rgba(0,0,0,0.32)';
+    ctx.beginPath();
+    ctx.ellipse(
+      c.x,
+      ground,
+      bodyW * (flying ? 0.28 : 0.34),
+      layout.cell * (flying ? 0.12 : 0.16),
+      0,
+      0,
+      Math.PI * 2,
+    );
+    ctx.fill();
+    if (planted) {
+      const s = bodyW * 0.72;
+      const pulse = 0.55 + Math.sin(now / 520 + u.id) * 0.2;
+      ctx.fillStyle = '#141a28';
+      ctx.strokeStyle = `rgba(${rgb.r},${rgb.g},${rgb.b},${0.55 + pulse * 0.45})`;
+      ctx.lineWidth = Math.max(2, layout.cell * 0.08);
       ctx.beginPath();
-      ctx.ellipse(c.x, c.y + layout.cell * 0.35, r * 0.9, r * 0.28, 0, 0, Math.PI * 2);
+      ctx.roundRect(c.x - s / 2, ground - layout.cell * 0.22, s, layout.cell * 0.36, 3);
       ctx.fill();
+      ctx.stroke();
     }
+    const feet = ground - air - bob;
     ctx.save();
-    ctx.translate(c.x, c.y + walk - air);
-    ctx.rotate(facing);
-    ctx.globalCompositeOperation = 'lighter';
-    const glow = ctx.createRadialGradient(0, 0, 1, 0, 0, r * 3);
-    glow.addColorStop(0, `rgba(${rgb.r},${rgb.g},${rgb.b},0.55)`);
-    glow.addColorStop(1, `rgba(${rgb.r},${rgb.g},${rgb.b},0)`);
-    ctx.fillStyle = glow;
-    ctx.beginPath();
-    ctx.arc(0, 0, r * 3, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.globalCompositeOperation = 'source-over';
-    ctx.fillStyle = `rgb(${rgb.r},${rgb.g},${rgb.b})`;
-    this.unitBody(u, r);
-    ctx.fillStyle = '#fff';
-    ctx.beginPath();
-    ctx.arc(r * 0.35, 0, r * 0.18, 0, Math.PI * 2);
-    ctx.fill();
+    ctx.translate(c.x, feet);
+    if ((sm?.faceSign ?? 1) < 0) ctx.scale(-1, 1);
+    if (portrait.complete && portrait.naturalWidth > 0) {
+      this.drawSprite(portrait, pose.back, pose.mix, bodyW, bodyH);
+    } else {
+      ctx.fillStyle = `rgb(${rgb.r},${rgb.g},${rgb.b})`;
+      ctx.translate(0, -bodyH * 0.45);
+      this.unitBody(u, bodyH * 0.28);
+    }
     ctx.restore();
-    this.hpRing(c.x, c.y - r - 6, Math.max(8, r + 3), u.hp / u.maxHp, rgb);
-    void cfg;
+    this.hpBar(c.x, feet - bodyH - 6, Math.max(16, bodyW * 0.72), u.hp / u.maxHp, rgb);
+  }
+
+  private unitPose(
+    u: UnitView,
+    now: number,
+    moving: boolean,
+    flying: boolean,
+    planted: boolean,
+  ): SpritePose {
+    const still = cardPortrait(u.cardId);
+    const held: SpritePose = { front: still, back: null, mix: 0 };
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return held;
+    const prev = this.swings.get(u.id);
+    if (prev === undefined) {
+      this.swings.set(u.id, { swing: u.swing, t0: now - 10_000 });
+    } else if (prev.swing !== u.swing) {
+      this.swings.set(u.id, { swing: u.swing, t0: now });
+    }
+    const rec = this.swings.get(u.id);
+    const attack = clipFrames(u.cardId, 'attack');
+    if (rec !== undefined && u.swing > 0 && attack.length > 1) {
+      const frameMs = 80;
+      const dur = (attack.length - 1) * frameMs;
+      const elapsed = now - rec.t0;
+      if (elapsed >= 0 && elapsed < dur) {
+        const hit = blendAt(attack, elapsed / frameMs, false);
+        if (hit !== null) return hit;
+      }
+    }
+    if (flying || (moving && !planted)) {
+      const walk = clipFrames(u.cardId, 'walk');
+      if (walk.length > 1) {
+        const cycle = manifest?.[u.cardId]?.walkMs;
+        const frameMs =
+          typeof cycle === 'number' && cycle > 0
+            ? Math.max(20, cycle / walk.length)
+            : flying
+              ? 130
+              : 100;
+        const step = blendAt(walk, now / frameMs + u.id * 0.37, true);
+        if (step !== null) return step;
+      }
+    }
+    const idle = frameAt(clipFrames(u.cardId, 'idle'), 0);
+    return idle === null ? held : { front: idle, back: null, mix: 0 };
+  }
+
+  private drawSprite(
+    front: HTMLImageElement,
+    back: HTMLImageElement | null,
+    mix: number,
+    bodyW: number,
+    bodyH: number,
+  ): void {
+    const { ctx } = this;
+    const base = ctx.globalAlpha;
+    const fade = Math.min(1, Math.max(0, mix));
+    ctx.globalAlpha = base * (back === null ? 1 : 1 - fade);
+    ctx.drawImage(front, -bodyW / 2, -bodyH, bodyW, bodyH);
+    if (back !== null && fade > 0.02 && back.complete && back.naturalWidth > 0) {
+      ctx.globalAlpha = base * fade;
+      ctx.drawImage(back, -bodyW / 2, -bodyH, bodyW, bodyH);
+    }
+    ctx.globalAlpha = base;
+  }
+
+  private paintFigure(
+    img: HTMLImageElement,
+    feetX: number,
+    feetY: number,
+    boxW: number,
+    boxH: number,
+    flip: boolean,
+    alpha: number,
+  ): void {
+    if (!img.complete || img.naturalWidth <= 0 || !(boxW > 0) || !(boxH > 0)) return;
+    const aspect = img.naturalWidth / img.naturalHeight;
+    let w = boxW;
+    let h = w / aspect;
+    if (h > boxH) {
+      h = boxH;
+      w = h * aspect;
+    }
+    const { ctx } = this;
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.translate(feetX, feetY);
+    if (flip) ctx.scale(-1, 1);
+    ctx.drawImage(img, -w / 2, -h, w, h);
+    ctx.restore();
   }
 
   private unitBody(u: UnitView, r: number): void {
@@ -732,20 +868,43 @@ export class CardArenaRenderer {
     ctx.fill();
   }
 
-  private drawShot(p: { x: number; y: number; side: Side }, now: number): void {
+  private drawShot(p: { id: number; x: number; y: number; side: Side }, now: number): void {
     const { ctx, layout } = this;
     const c = this.toScreen(p.x, p.y);
+    const prev = this.shotPrev.get(p.id);
+    let ang = p.side === 1 ? -Math.PI / 2 : Math.PI / 2;
+    if (prev !== undefined) {
+      const a = this.toScreen(prev.x, prev.y);
+      const dx = c.x - a.x;
+      const dy = c.y - a.y;
+      if (dx * dx + dy * dy > 0.25) ang = Math.atan2(dy, dx);
+    }
+    this.shotPrev.set(p.id, { x: p.x, y: p.y });
     const rgb = p.side === 1 ? MAGENTA : CYAN;
+    const len = layout.cell * 0.95;
     ctx.save();
-    ctx.globalCompositeOperation = 'lighter';
-    const g = ctx.createRadialGradient(c.x, c.y, 0, c.x, c.y, layout.cell * 0.55);
-    g.addColorStop(0, '#fff');
-    g.addColorStop(0.35, `rgba(${rgb.r},${rgb.g},${rgb.b},0.9)`);
-    g.addColorStop(1, `rgba(${rgb.r},${rgb.g},${rgb.b},0)`);
-    ctx.fillStyle = g;
+    ctx.translate(c.x, c.y);
+    ctx.rotate(ang);
+    ctx.strokeStyle = `rgb(${rgb.r},${rgb.g},${rgb.b})`;
+    ctx.fillStyle = `rgb(${rgb.r},${rgb.g},${rgb.b})`;
+    ctx.lineWidth = Math.max(2, layout.cell * 0.08);
+    ctx.lineCap = 'round';
     ctx.beginPath();
-    ctx.arc(c.x, c.y, layout.cell * 0.55, 0, Math.PI * 2);
+    ctx.moveTo(-len * 0.55, 0);
+    ctx.lineTo(len * 0.15, 0);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(len * 0.55, 0);
+    ctx.lineTo(len * 0.05, -len * 0.22);
+    ctx.lineTo(len * 0.05, len * 0.22);
+    ctx.closePath();
     ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(-len * 0.55, 0);
+    ctx.lineTo(-len * 0.28, -len * 0.18);
+    ctx.moveTo(-len * 0.55, 0);
+    ctx.lineTo(-len * 0.28, len * 0.18);
+    ctx.stroke();
     ctx.restore();
     void now;
   }
@@ -768,11 +927,21 @@ export class CardArenaRenderer {
       }
       const c = this.toScreen(s.x, s.y);
       ctx.fillStyle = `rgba(${s.rgb.r},${s.rgb.g},${s.rgb.b},${s.life})`;
-      ctx.beginPath();
-      ctx.arc(c.x, c.y, s.size * s.life * (layout.cell / 16), 0, Math.PI * 2);
-      ctx.fill();
+      if (fillCircle(ctx, c.x, c.y, s.size * s.life * (layout.cell / 16))) ctx.fill();
     }
     ctx.restore();
+  }
+
+  private hpBar(x: number, y: number, w: number, pct: number, rgb: Rgb): void {
+    const { ctx } = this;
+    const p = Math.max(0, Math.min(1, pct));
+    const h = 4;
+    const left = x - w / 2;
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(left - 1, y - 1, w + 2, h + 2);
+    if (p <= 0) return;
+    ctx.fillStyle = `rgb(${rgb.r},${rgb.g},${rgb.b})`;
+    ctx.fillRect(left, y, w * p, h);
   }
 
   private hpRing(x: number, y: number, r: number, pct: number, rgb: Rgb): void {
@@ -841,6 +1010,17 @@ export class CardArenaRenderer {
     const s = scale - gap;
     const px = gx * scale + gap / 2;
     const py = gy * scale + gap / 2;
+    if (owner === 3) {
+      this.pctx.fillStyle = '#1b2438';
+      this.pctx.beginPath();
+      this.pctx.roundRect(px, py, s, s, 3);
+      this.pctx.fill();
+      this.pctx.fillStyle = 'rgba(186, 206, 240, 0.28)';
+      this.pctx.beginPath();
+      this.pctx.roundRect(px, py, s, s * 0.35, 3);
+      this.pctx.fill();
+      return;
+    }
     const rgb = owner === 1 ? MAGENTA : owner === 2 ? CYAN : null;
     if (rgb === null) {
       this.pctx.clearRect(gx * scale, gy * scale, scale, scale);
@@ -859,6 +1039,100 @@ export class CardArenaRenderer {
     this.pctx.roundRect(px, py, s, s * 0.38, 3);
     this.pctx.fill();
   }
+}
+
+const portraits = new Map<CardId, HTMLImageElement>();
+
+type ClipName = 'walk' | 'attack' | 'idle';
+
+type AnimManifest = Partial<
+  Record<CardId, Partial<Record<ClipName, number>> & { body?: number; walkMs?: number }>
+>;
+
+type SpritePose = {
+  front: HTMLImageElement;
+  back: HTMLImageElement | null;
+  mix: number;
+};
+
+let manifest: AnimManifest | null = null;
+let manifestStarted = false;
+const clips = new Map<string, HTMLImageElement[]>();
+
+function loadAnim(): void {
+  if (manifestStarted || typeof fetch !== 'function') return;
+  manifestStarted = true;
+  void fetch('/cards/anim/manifest.json')
+    .then((res) => (res.ok ? res.json() : null))
+    .then((data) => {
+      if (data === null || typeof data !== 'object') return;
+      manifest = data as AnimManifest;
+      clips.clear();
+    })
+    .catch(() => undefined);
+}
+
+function clipFrames(id: CardId, clip: ClipName): HTMLImageElement[] {
+  const key = `${id}:${clip}`;
+  const found = clips.get(key);
+  if (found !== undefined) return found;
+  const n = manifest?.[id]?.[clip] ?? 0;
+  const frames: HTMLImageElement[] = [];
+  for (let i = 1; i <= n; i += 1) {
+    const img = new Image();
+    img.src = `/cards/anim/${id}/${clip}/${String(i).padStart(2, '0')}.png`;
+    frames.push(img);
+  }
+  clips.set(key, frames);
+  return frames;
+}
+
+function frameAt(frames: HTMLImageElement[], index: number): HTMLImageElement | null {
+  if (frames.length === 0) return null;
+  const img = frames[((index % frames.length) + frames.length) % frames.length];
+  if (img === undefined || !img.complete || img.naturalWidth <= 0) return null;
+  return img;
+}
+
+function blendAt(frames: HTMLImageElement[], pos: number, loop: boolean): SpritePose | null {
+  const n = frames.length;
+  if (n === 0 || !Number.isFinite(pos)) return null;
+  if (!loop && pos >= n - 1) {
+    const last = frameAt(frames, n - 1);
+    return last === null ? null : { front: last, back: null, mix: 0 };
+  }
+  const span = loop ? ((pos % n) + n) % n : Math.max(0, pos);
+  const i = Math.floor(span);
+  // Hold each drawing. Crossfading two full-body frames doubles the limbs and reads as jitter.
+  const front = frameAt(frames, i);
+  if (front === null) return null;
+  return { front, back: null, mix: 0 };
+}
+
+function blendClip(id: CardId, clip: ClipName, pos: number, loop: boolean): SpritePose | null {
+  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return null;
+  return blendAt(clipFrames(id, clip), pos, loop);
+}
+
+function bodyFill(id: CardId): number {
+  const n = manifest?.[id]?.body;
+  return typeof n === 'number' && n > 0.35 && n <= 1 ? n : 1;
+}
+
+function fillCircle(ctx: CanvasRenderingContext2D, x: number, y: number, r: number): boolean {
+  if (!Number.isFinite(x) || !Number.isFinite(y) || !(r > 0)) return false;
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, Math.PI * 2);
+  return true;
+}
+
+function cardPortrait(id: CardId): HTMLImageElement {
+  const found = portraits.get(id);
+  if (found !== undefined) return found;
+  const img = new Image();
+  img.src = `/cards/${id}.png`;
+  portraits.set(id, img);
+  return img;
 }
 
 function hex(

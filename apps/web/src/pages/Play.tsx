@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 import { sfxCountdown, sfxDash, sfxWin, unlockAudio } from '../game/audio';
 import { InputCtl } from '../game/input';
 import { guestId, Net } from '../game/net';
+import { clearSeat, rememberRoom } from '../game/seat';
 import { ArenaRenderer } from '../game/renderer';
 import type { PlayIntent } from './Lobby';
 
@@ -26,6 +27,7 @@ type Hud = {
   waiting: string | null;
   room: string | null;
   overReason: string | null;
+  mapName: string;
 };
 
 const emptyHud: Hud = {
@@ -41,6 +43,7 @@ const emptyHud: Hud = {
   waiting: 'Connecting…',
   room: null,
   overReason: null,
+  mapName: '',
 };
 
 export function Play({ name, intent, onExit }: Props) {
@@ -48,6 +51,7 @@ export function Play({ name, intent, onExit }: Props) {
   const stickRef = useRef<HTMLDivElement>(null);
   const knobRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<InputCtl | null>(null);
+  const netRef = useRef<Net | null>(null);
   const [hud, setHud] = useState<Hud>(emptyHud);
   const [rtt, setRtt] = useState(0);
   const [error, setError] = useState<string | null>(null);
@@ -62,9 +66,11 @@ export function Play({ name, intent, onExit }: Props) {
     const input = new InputCtl();
     inputRef.current = input;
     const net = new Net();
+    netRef.current = net;
     let config: GameConfig | null = null;
     let seq = 0;
     let playing = false;
+    let gone = false;
     let lastDash = false;
     let lastCount = -1;
     let raf = 0;
@@ -73,7 +79,11 @@ export function Play({ name, intent, onExit }: Props) {
     const unbind = input.attach(window);
     const onResize = () => renderer.resize();
     const onEsc = (e: KeyboardEvent) => {
-      if (e.code === 'Escape') onExit();
+      if (e.code === 'Escape') {
+        clearSeat();
+        net.send({ type: 'leave' });
+        onExit();
+      }
     };
     window.addEventListener('resize', onResize);
     window.addEventListener('keydown', onEsc);
@@ -89,6 +99,7 @@ export function Play({ name, intent, onExit }: Props) {
         dashReadyIn: state.you.dashReadyIn,
         winner: state.winner,
         waiting: null,
+        mapName: state.mapName,
       }));
       if (state.phase === 'countdown') {
         const n = Math.max(1, Math.ceil(state.countdownLeft));
@@ -106,6 +117,12 @@ export function Play({ name, intent, onExit }: Props) {
       setRtt(net.rtt);
       switch (msg.type) {
         case 'welcome':
+          if (msg.resume === true) break;
+          if (intent.kind === 'resume') {
+            clearSeat();
+            onExit();
+            break;
+          }
           if (intent.kind === 'cpu') net.send({ type: 'play_cpu', game: 'spray' });
           else if (intent.kind === 'queue') net.send({ type: 'queue', game: 'spray' });
           else if (intent.kind === 'create') net.send({ type: 'create_room', game: 'spray' });
@@ -118,6 +135,7 @@ export function Play({ name, intent, onExit }: Props) {
           setHud((h) => ({ ...h, waiting: msg.message }));
           break;
         case 'room':
+          rememberRoom(msg.code);
           setHud((h) => ({
             ...h,
             room: msg.code,
@@ -142,6 +160,7 @@ export function Play({ name, intent, onExit }: Props) {
             waiting: null,
             room: null,
             overReason: null,
+            mapName: msg.state.mapName,
           });
           break;
         case 'state':
@@ -150,6 +169,7 @@ export function Play({ name, intent, onExit }: Props) {
           break;
         case 'match_end':
           playing = false;
+          clearSeat();
           setHud((h) => ({
             ...h,
             phase: 'over',
@@ -168,7 +188,7 @@ export function Play({ name, intent, onExit }: Props) {
       }
     };
     net.onClose = () => {
-      if (hudRef.current.phase !== 'over') setError('disconnected');
+      if (!gone && hudRef.current.phase !== 'over') setError('disconnected');
     };
     net.connect();
 
@@ -231,16 +251,21 @@ export function Play({ name, intent, onExit }: Props) {
     stick?.addEventListener('pointercancel', endPointer);
 
     return () => {
+      gone = true;
       cancelAnimationFrame(raf);
       window.removeEventListener('resize', onResize);
       window.removeEventListener('keydown', onEsc);
       unbind();
       inputRef.current = null;
-      net.send({ type: 'leave' });
       net.close();
     };
   }, [intent, name]);
 
+  const quit = () => {
+    clearSeat();
+    netRef.current?.send({ type: 'leave' });
+    onExit();
+  };
   const total = hud.scores.p1 + hud.scores.p2 + hud.scores.empty || 1;
   const pingClass = rtt < 50 ? 'ping-good' : rtt < 100 ? 'ping-ok' : 'ping-bad';
   const youWin = hud.winner === hud.side;
@@ -262,7 +287,10 @@ export function Play({ name, intent, onExit }: Props) {
               <span className="p2" style={{ width: `${(hud.scores.p2 / total) * 100}%` }} />
             </div>
           </div>
-          <div className="timer">{fmtTime(hud.timeLeft)}</div>
+          <div className="timer-wrap">
+            <div className="map-name">{hud.mapName}</div>
+            <div className="timer">{fmtTime(hud.timeLeft)}</div>
+          </div>
           <div className="meta">
             <div className={pingClass}>{Math.round(rtt)} ms</div>
             <div>
@@ -294,7 +322,7 @@ export function Play({ name, intent, onExit }: Props) {
             <p className="eyebrow">color clash</p>
             <h2>{hud.room ?? 'WAIT'}</h2>
             <p>{hud.waiting}</p>
-            <button className="btn btn-ghost" type="button" onClick={onExit}>
+            <button className="btn btn-ghost" type="button" onClick={quit}>
               Leave
             </button>
           </div>
@@ -314,7 +342,7 @@ export function Play({ name, intent, onExit }: Props) {
             <p>
               {hud.scores.p1} — {hud.scores.p2}
             </p>
-            <button className="btn btn-cyan" type="button" onClick={onExit}>
+            <button className="btn btn-cyan" type="button" onClick={quit}>
               Back
             </button>
           </div>
@@ -325,7 +353,7 @@ export function Play({ name, intent, onExit }: Props) {
           <div>
             <h2>DROP</h2>
             <p>{error}</p>
-            <button className="btn btn-ghost" type="button" onClick={onExit}>
+            <button className="btn btn-ghost" type="button" onClick={quit}>
               Back
             </button>
           </div>

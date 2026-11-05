@@ -1,8 +1,29 @@
-import { CARD_CATALOG, CARD_IDS, cardOf, type CardId } from './cards.ts';
+import {
+  CARD_CATALOG,
+  DEFAULT_DECK,
+  legalDeck,
+  defaultCardTable,
+  mergeCardTable,
+  tunedCard,
+  type CardId,
+  type CardTable,
+} from './cards.ts';
 import type { ArenaConfig } from './arena-config.ts';
 import { countScores, paintAt } from './sim.ts';
 import type { Phase, Side, Winner } from './kinds.ts';
 import type { Rng } from './ai.ts';
+import {
+  BLOCKED,
+  MAP_NAMES,
+  bfsFirstStep,
+  blockedAt,
+  fieldScores,
+  claimHalves,
+  firstStep,
+  rollMap,
+  slide,
+  type MapId,
+} from './maps.ts';
 
 export type UnitRole = 'melee' | 'ranged' | 'flying' | 'building';
 
@@ -20,6 +41,8 @@ export type ArenaUnit = {
   dmg: number;
   attackTicks: number;
   cooldown: number;
+  /** Increments once each time this unit actually swings, shoots, or casts. */
+  swing: number;
   paint: number;
   lifetime: number | null;
 };
@@ -48,8 +71,10 @@ export type ArenaProjectile = {
   vy: number;
   dmg: number;
   paint: number;
-  targetKind: 'unit' | 'tower';
+  targetKind: 'unit' | 'tower' | 'ground';
   targetId: number;
+  aimX: number;
+  aimY: number;
 };
 
 export type ArenaPlayer = {
@@ -61,6 +86,8 @@ export type ArenaPlayer = {
 export type ArenaSim = {
   tick: number;
   grid: Uint8Array;
+  mapId: MapId;
+  mapName: string;
   units: ArenaUnit[];
   towers: ArenaTower[];
   projectiles: ArenaProjectile[];
@@ -71,6 +98,7 @@ export type ArenaSim = {
   winner: Winner;
   reason: 'time' | 'king' | 'forfeit' | 'paint' | null;
   dirty: number[];
+  cards: CardTable;
 };
 
 export type PlayCommand = {
@@ -125,12 +153,22 @@ export function shuffleInPlace<T>(items: T[], rng: Rng): void {
   }
 }
 
-export function createArena(config: ArenaConfig, rng: Rng = Math.random): ArenaSim {
-  const p1 = makePlayer(config, rng);
-  const p2 = makePlayer(config, rng);
-  const sim: ArenaSim = {
+export function createArena(
+  config: ArenaConfig,
+  rng: Rng = Math.random,
+  cards: CardTable = defaultCardTable(),
+  decks?: { p1?: readonly CardId[]; p2?: readonly CardId[] },
+): ArenaSim {
+  const grid = new Uint8Array(config.arenaW * config.arenaH);
+  const mapId = rollMap(grid, config.arenaW, config.arenaH, rng);
+  claimHalves(grid, config.arenaW, config.arenaH, rng);
+  const p1 = makePlayer(config, rng, decks?.p1);
+  const p2 = makePlayer(config, rng, decks?.p2);
+  return {
     tick: 0,
-    grid: new Uint8Array(config.arenaW * config.arenaH),
+    grid,
+    mapId,
+    mapName: MAP_NAMES[mapId],
     units: [],
     towers: [],
     projectiles: [],
@@ -141,27 +179,17 @@ export function createArena(config: ArenaConfig, rng: Rng = Math.random): ArenaS
     winner: 0,
     reason: null,
     dirty: [],
+    cards: mergeCardTable(cards),
   };
-  paintTerritory(sim, config);
-  placeTowers(sim, config);
-  return sim;
 }
 
-function paintTerritory(sim: ArenaSim, config: ArenaConfig): void {
-  const w = config.arenaW;
-  const h = config.arenaH;
-  const mid = Math.floor(h / 2);
-  for (let y = 0; y < h; y += 1) {
-    const owner: 1 | 2 = y < mid ? 1 : 2;
-    for (let x = 0; x < w; x += 1) {
-      const i = y * w + x;
-      sim.grid[i] = owner;
-    }
-  }
-}
-
-function makePlayer(config: ArenaConfig, rng: Rng): ArenaPlayer {
-  const deck: CardId[] = [...CARD_IDS];
+function makePlayer(
+  config: ArenaConfig,
+  rng: Rng,
+  chosen?: readonly CardId[],
+): ArenaPlayer {
+  const deck: CardId[] =
+    chosen !== undefined && legalDeck(chosen) ? [...chosen] : [...DEFAULT_DECK];
   shuffleInPlace(deck, rng);
   const hand = deck.splice(0, 4);
   return {
@@ -169,45 +197,6 @@ function makePlayer(config: ArenaConfig, rng: Rng): ArenaPlayer {
     hand,
     deck,
   };
-}
-
-function placeTowers(sim: ArenaSim, config: ArenaConfig): void {
-  const w = config.arenaW;
-  const h = config.arenaH;
-  const atk = Math.max(8, Math.round(0.85 * config.tickHz));
-  const mk = (
-    side: Side,
-    slot: ArenaTower['slot'],
-    x: number,
-    y: number,
-    hp: number,
-    active: boolean,
-  ): ArenaTower => {
-    const id = sim.nextId;
-    sim.nextId += 1;
-    return {
-      id,
-      side,
-      slot,
-      x,
-      y,
-      hp,
-      maxHp: hp,
-      range: slot === 'king' ? config.kingRange : config.towerRange,
-      dmg: config.towerDmg,
-      cooldown: 0,
-      attackTicks: atk,
-      active,
-    };
-  };
-  sim.towers.push(
-    mk(1, 'king', w * 0.5, 2.4, config.kingHp, true),
-    mk(1, 'left', w * 0.28, 7.2, config.sideHp, true),
-    mk(1, 'right', w * 0.72, 7.2, config.sideHp, true),
-    mk(2, 'king', w * 0.5, h - 2.4, config.kingHp, true),
-    mk(2, 'left', w * 0.28, h - 7.2, config.sideHp, true),
-    mk(2, 'right', w * 0.72, h - 7.2, config.sideHp, true),
-  );
 }
 
 export function playerOfArena(sim: ArenaSim, side: Side): ArenaPlayer {
@@ -232,6 +221,18 @@ export function ownerAt(
   return 0;
 }
 
+/** Top-left cell and exclusive end of the square a card needs. */
+export function footprintOf(
+  x: number,
+  y: number,
+  span: number,
+): { x0: number; y0: number; x1: number; y1: number } {
+  const n = Math.max(1, Math.floor(span));
+  const x0 = Math.floor(x);
+  const y0 = Math.floor(y);
+  return { x0, y0, x1: x0 + n, y1: y0 + n };
+}
+
 export function canDropAt(
   grid: Uint8Array,
   config: ArenaConfig,
@@ -239,12 +240,22 @@ export function canDropAt(
   cardId: CardId,
   x: number,
   y: number,
+  cards?: CardTable,
 ): boolean {
-  const def = cardOf(cardId);
+  const def = tunedCard(cards, cardId);
   if (def === null) return false;
   if (!inBounds(config, x, y)) return false;
-  if (def.role === 'spell') return true;
-  return ownerAt(grid, config.arenaW, config.arenaH, x, y) === side;
+  if (def.role === 'spell') return !blockedAt(grid, config.arenaW, config.arenaH, x, y);
+  const box = footprintOf(x, y, def.span);
+  const w = config.arenaW;
+  const h = config.arenaH;
+  if (box.x0 < 0 || box.y0 < 0 || box.x1 > w || box.y1 > h) return false;
+  for (let cy = box.y0; cy < box.y1; cy += 1) {
+    for (let cx = box.x0; cx < box.x1; cx += 1) {
+      if (grid[cy * w + cx] !== side) return false;
+    }
+  }
+  return true;
 }
 
 export function canPlayAt(
@@ -255,7 +266,7 @@ export function canPlayAt(
   x: number,
   y: number,
 ): boolean {
-  return canDropAt(sim.grid, config, side, cardId, x, y);
+  return canDropAt(sim.grid, config, side, cardId, x, y, sim.cards);
 }
 
 export function tryPlay(
@@ -266,7 +277,7 @@ export function tryPlay(
 ): boolean {
   if (sim.over) return false;
   if (arenaPhase(sim.tick, config) !== 'play') return false;
-  const def = cardOf(cmd.cardId);
+  const def = tunedCard(sim.cards, cmd.cardId);
   if (def === null) return false;
   const player = playerOfArena(sim, side);
   const idx = player.hand.indexOf(cmd.cardId);
@@ -299,8 +310,32 @@ function spawnFromCard(
   for (let i = 0; i < n; i += 1) {
     const ox = n === 1 ? 0 : (i - (n - 1) / 2) * 0.7;
     const oy = n === 1 ? 0 : (i % 2 === 0 ? -0.35 : 0.35);
-    spawnUnit(sim, config, side, def, x + ox, y + oy);
+    const spot = openNear(sim, config, x + ox, y + oy);
+    spawnUnit(sim, config, side, def, spot.x, spot.y);
   }
+}
+
+function openNear(
+  sim: ArenaSim,
+  config: ArenaConfig,
+  x: number,
+  y: number,
+): { x: number; y: number } {
+  if (!blockedAt(sim.grid, config.arenaW, config.arenaH, x, y) && inBounds(config, x, y)) {
+    return { x, y };
+  }
+  for (let r = 1; r <= 4; r += 1) {
+    for (let a = 0; a < 8; a += 1) {
+      const ang = (a / 8) * Math.PI * 2;
+      const nx = x + Math.cos(ang) * r;
+      const ny = y + Math.sin(ang) * r;
+      if (!inBounds(config, nx, ny)) continue;
+      if (!blockedAt(sim.grid, config.arenaW, config.arenaH, nx, ny)) {
+        return { x: nx, y: ny };
+      }
+    }
+  }
+  return { x, y };
 }
 
 function spawnUnit(
@@ -334,6 +369,7 @@ function spawnUnit(
     dmg: def.dmg * config.unitDmgMul,
     attackTicks: Math.max(4, Math.round(def.attackSec * config.tickHz)),
     cooldown: 0,
+    swing: 0,
     paint: def.paint,
     lifetime,
   });
@@ -404,8 +440,12 @@ function regenEnergy(sim: ArenaSim, config: ArenaConfig): void {
   sim.p2.energy = Math.min(config.energyMax, sim.p2.energy + add);
 }
 
+const CHASE_RANGE = 9;
+
 function tickUnits(sim: ArenaSim, config: ArenaConfig): void {
   const dt = 1 / config.tickHz;
+  const w = config.arenaW;
+  const h = config.arenaH;
   for (const u of sim.units) {
     if (u.hp <= 0) continue;
     if (u.lifetime !== null) {
@@ -418,57 +458,248 @@ function tickUnits(sim: ArenaSim, config: ArenaConfig): void {
     if (u.cooldown > 0) u.cooldown -= 1;
     paintAt(
       sim.grid,
-      { arenaW: config.arenaW, arenaH: config.arenaH, paintRadius: u.paint },
+      { arenaW: w, arenaH: h, paintRadius: u.paint },
       u.x,
       u.y,
       u.side,
       sim.dirty,
     );
-    if (u.role === 'building') {
-      fireAt(sim, config, u);
+    const engaged = targetInRange(sim, u);
+    if (engaged !== null) {
+      fireAt(sim, config, u, engaged);
       continue;
     }
+    fireGround(sim, config, u);
+    if (u.role === 'building') continue;
     const target = nearestEnemy(sim, u);
-    if (target === null) continue;
-    const dist = Math.hypot(target.x - u.x, target.y - u.y);
-    if (dist <= u.range + 0.05) {
-      fireAt(sim, config, u);
-      continue;
+    if (target !== null) {
+      const dist = Math.hypot(target.x - u.x, target.y - u.y);
+      if (dist <= CHASE_RANGE) {
+        const way =
+          u.role === 'flying'
+            ? { x: target.x, y: target.y }
+            : firstStep(sim.grid, w, h, u.x, u.y, target.x, target.y);
+        if (way !== null && stepToward(sim, config, u, way.x, way.y, dt)) continue;
+      }
     }
-    const nx = (target.x - u.x) / (dist || 1);
-    const ny = (target.y - u.y) / (dist || 1);
-    u.x = clamp(u.x + nx * u.speed * dt, 0.4, config.arenaW - 0.4);
-    u.y = clamp(u.y + ny * u.speed * dt, 0.4, config.arenaH - 0.4);
+    const paintWay =
+      u.role === 'flying'
+        ? flyPaintGoal(sim.grid, w, h, u)
+        : bfsFirstStep(sim.grid, w, h, u.x, u.y, (cx, cy, dist) =>
+            paintScore(sim.grid, w, h, u, cx, cy, dist),
+          );
+    if (paintWay !== null && stepToward(sim, config, u, paintWay.x, paintWay.y, dt)) continue;
+    wander(sim, config, u, dt);
   }
 }
 
+function paintScore(
+  grid: Uint8Array,
+  w: number,
+  h: number,
+  u: ArenaUnit,
+  cx: number,
+  cy: number,
+  dist: number,
+): number | null {
+  const v = grid[cy * w + cx] ?? 0;
+  if (v === u.side) return null;
+  const jitter = ((cx * 3 + cy + u.id) % 4) * 0.35;
+  const rank = v === 0 ? dist + w * h : dist;
+  return rank + jitter;
+}
+
+function flyPaintGoal(
+  grid: Uint8Array,
+  w: number,
+  h: number,
+  u: ArenaUnit,
+): { x: number; y: number } | null {
+  const sx = Math.floor(u.x);
+  const sy = Math.floor(u.y);
+  let best = Infinity;
+  let bx = -1;
+  let by = -1;
+  for (let cy = 0; cy < h; cy += 1) {
+    for (let cx = 0; cx < w; cx += 1) {
+      if (cx === sx && cy === sy) continue;
+      const v = grid[cy * w + cx] ?? 0;
+      if (v === u.side || v === BLOCKED) continue;
+      const dist = Math.abs(cx - sx) + Math.abs(cy - sy);
+      const jitter = ((cx * 3 + cy + u.id) % 4) * 0.35;
+      const score = (v === 0 ? dist + w * h : dist) + jitter;
+      if (score >= best) continue;
+      best = score;
+      bx = cx;
+      by = cy;
+    }
+  }
+  if (bx < 0) return null;
+  return { x: bx + 0.5, y: by + 0.5 };
+}
+
+function stepToward(
+  sim: ArenaSim,
+  config: ArenaConfig,
+  u: ArenaUnit,
+  tx: number,
+  ty: number,
+  dt: number,
+): boolean {
+  const dx = tx - u.x;
+  const dy = ty - u.y;
+  const dist = Math.hypot(dx, dy);
+  if (dist < 0.05) return true;
+  const step = u.speed * dt;
+  const w = config.arenaW;
+  const h = config.arenaH;
+  if (u.role === 'flying') {
+    const scale = Math.min(1, step / dist);
+    u.x = clamp(u.x + dx * scale, 0.4, w - 0.4);
+    u.y = clamp(u.y + dy * scale, 0.4, h - 0.4);
+    return true;
+  }
+  const moved = slide(sim.grid, w, h, u.x, u.y, (dx / dist) * step, (dy / dist) * step, 0.4);
+  const progressed = moved.x !== u.x || moved.y !== u.y;
+  u.x = moved.x;
+  u.y = moved.y;
+  return progressed;
+}
+
+function wander(sim: ArenaSim, config: ArenaConfig, u: ArenaUnit, dt: number): void {
+  const w = config.arenaW;
+  const h = config.arenaH;
+  const heading = ((u.id * 17 + sim.tick) % 16) * (Math.PI / 8);
+  const step = u.speed * dt;
+  if (u.role === 'flying') {
+    u.x = clamp(u.x + Math.cos(heading) * step, 0.4, w - 0.4);
+    u.y = clamp(u.y + Math.sin(heading) * step, 0.4, h - 0.4);
+    return;
+  }
+  let moved = slide(
+    sim.grid,
+    w,
+    h,
+    u.x,
+    u.y,
+    Math.cos(heading) * step,
+    Math.sin(heading) * step,
+    0.4,
+  );
+  if (moved.x === u.x && moved.y === u.y) {
+    const turn = heading + Math.PI / 2;
+    moved = slide(sim.grid, w, h, u.x, u.y, Math.cos(turn) * step, Math.sin(turn) * step, 0.4);
+  }
+  u.x = moved.x;
+  u.y = moved.y;
+}
+
 function tickTowers(sim: ArenaSim, config: ArenaConfig): void {
+  const w = config.arenaW;
+  const h = config.arenaH;
   for (const t of sim.towers) {
     if (t.hp <= 0 || !t.active) continue;
     if (t.cooldown > 0) t.cooldown -= 1;
-    const unit = nearestEnemyUnit(sim, t.side, t.x, t.y, t.range);
-    if (unit === null) continue;
     if (t.cooldown > 0) continue;
+    const unit = nearestEnemyUnit(sim, t.side, t.x, t.y, t.range);
+    if (unit !== null) {
+      t.cooldown = t.attackTicks;
+      spawnProjectile(sim, t.side, t.x, t.y, unit.x, unit.y, t.dmg, 0.35, {
+        kind: 'unit',
+        id: unit.id,
+      });
+      continue;
+    }
+    const spot = groundAim(sim.grid, w, h, t.x, t.y, t.range, t.side, t.id + sim.tick);
+    if (spot === null) continue;
     t.cooldown = t.attackTicks;
-    spawnProjectile(sim, t.side, t.x, t.y, unit.x, unit.y, t.dmg, 0.35, {
-      kind: 'unit',
-      id: unit.id,
+    spawnProjectile(sim, t.side, t.x, t.y, spot.x, spot.y, 0, 1.15, {
+      kind: 'ground',
+      id: 0,
     });
   }
 }
 
-function fireAt(sim: ArenaSim, config: ArenaConfig, u: ArenaUnit): void {
-  if (u.cooldown > 0 || u.hp <= 0) return;
-  const target = nearestEnemy(sim, u);
-  if (target === null) return;
-  const dist = Math.hypot(target.x - u.x, target.y - u.y);
-  if (dist > u.range + 0.2) return;
+function fireAt(sim: ArenaSim, config: ArenaConfig, u: ArenaUnit, target: Target): boolean {
+  if (u.cooldown > 0 || u.hp <= 0) return false;
   u.cooldown = u.attackTicks;
+  u.swing += 1;
   if (u.role === 'ranged' || u.role === 'building' || u.role === 'flying') {
     spawnProjectile(sim, u.side, u.x, u.y, target.x, target.y, u.dmg, u.paint * 0.5, target.ref);
-    return;
+    return true;
   }
   applyHit(sim, config, u.side, target.ref, u.dmg, u.paint, target.x, target.y);
+  return true;
+}
+
+function fireGround(sim: ArenaSim, config: ArenaConfig, u: ArenaUnit): void {
+  if (u.cooldown > 0 || u.hp <= 0) return;
+  const reach = u.role === 'melee' ? Math.max(u.range, 1.15) : u.range;
+  const spot = groundAim(
+    sim.grid,
+    config.arenaW,
+    config.arenaH,
+    u.x,
+    u.y,
+    reach,
+    u.side,
+    u.id + sim.tick,
+  );
+  if (spot === null) return;
+  u.cooldown = u.attackTicks;
+  u.swing += 1;
+  if (u.role === 'ranged' || u.role === 'building' || u.role === 'flying') {
+    spawnProjectile(sim, u.side, u.x, u.y, spot.x, spot.y, 0, u.paint, {
+      kind: 'ground',
+      id: 0,
+    });
+    return;
+  }
+  paintAt(
+    sim.grid,
+    { arenaW: config.arenaW, arenaH: config.arenaH, paintRadius: u.paint },
+    spot.x,
+    spot.y,
+    u.side,
+    sim.dirty,
+  );
+}
+
+function groundAim(
+  grid: Uint8Array,
+  w: number,
+  h: number,
+  x: number,
+  y: number,
+  range: number,
+  side: Side,
+  salt: number,
+): { x: number; y: number } | null {
+  const r2 = range * range;
+  const x0 = Math.max(0, Math.floor(x - range));
+  const x1 = Math.min(w - 1, Math.ceil(x + range));
+  const y0 = Math.max(0, Math.floor(y - range));
+  const y1 = Math.min(h - 1, Math.ceil(y + range));
+  let best = Infinity;
+  let bx = -1;
+  let by = -1;
+  for (let cy = y0; cy <= y1; cy += 1) {
+    for (let cx = x0; cx <= x1; cx += 1) {
+      const v = grid[cy * w + cx] ?? 0;
+      if (v === BLOCKED || v === side) continue;
+      const dx = cx + 0.5 - x;
+      const dy = cy + 0.5 - y;
+      if (dx * dx + dy * dy > r2) continue;
+      const dist = Math.hypot(dx, dy);
+      const score = (v === 0 ? dist + w * h : dist) + ((cx * 3 + cy + salt) % 4) * 0.2;
+      if (score >= best) continue;
+      best = score;
+      bx = cx;
+      by = cy;
+    }
+  }
+  if (bx < 0) return null;
+  return { x: bx + 0.5, y: by + 0.5 };
 }
 
 function spawnProjectile(
@@ -480,7 +711,7 @@ function spawnProjectile(
   ty: number,
   dmg: number,
   paint: number,
-  target: { kind: 'unit' | 'tower'; id: number },
+  target: { kind: 'unit' | 'tower' | 'ground'; id: number },
 ): void {
   const dist = Math.hypot(tx - x, ty - y) || 1;
   const speed = 18;
@@ -497,6 +728,8 @@ function spawnProjectile(
     paint,
     targetKind: target.kind,
     targetId: target.id,
+    aimX: tx,
+    aimY: ty,
   });
 }
 
@@ -516,7 +749,16 @@ function tickProjectiles(sim: ArenaSim, config: ArenaConfig): void {
     const hit = dest !== null ? Math.hypot(dest.x - p.x, dest.y - p.y) < 0.45 : false;
     const oob = !inBounds(config, p.x, p.y);
     if (hit || oob) {
-      if (hit && dest !== null) {
+      if (p.targetKind === 'ground' && dest !== null) {
+        paintAt(
+          sim.grid,
+          { arenaW: config.arenaW, arenaH: config.arenaH, paintRadius: Math.max(0.45, p.paint) },
+          dest.x,
+          dest.y,
+          p.side,
+          sim.dirty,
+        );
+      } else if (hit && dest !== null && p.targetKind !== 'ground') {
         applyHit(sim, config, p.side, { kind: p.targetKind, id: p.targetId }, p.dmg, p.paint, p.x, p.y);
       }
       continue;
@@ -530,6 +772,7 @@ function projectileDest(
   sim: ArenaSim,
   p: ArenaProjectile,
 ): { x: number; y: number } | null {
+  if (p.targetKind === 'ground') return { x: p.aimX, y: p.aimY };
   if (p.targetKind === 'unit') {
     const u = sim.units.find((x) => x.id === p.targetId && x.hp > 0);
     return u === undefined ? null : { x: u.x, y: u.y };
@@ -572,6 +815,33 @@ type Target = {
   y: number;
   ref: { kind: 'unit' | 'tower'; id: number };
 };
+
+function targetInRange(sim: ArenaSim, attacker: ArenaUnit): Target | null {
+  const hitsAir = attacker.role !== 'melee';
+  const reach = attacker.range + 0.05;
+  const r2 = reach * reach;
+  let unit: Target | null = null;
+  let unitD = Infinity;
+  for (const other of sim.units) {
+    if (other.side === attacker.side || other.hp <= 0 || other.id === attacker.id) continue;
+    if (other.role === 'flying' && !hitsAir) continue;
+    const d = (other.x - attacker.x) * (other.x - attacker.x) + (other.y - attacker.y) * (other.y - attacker.y);
+    if (d > r2 || d >= unitD) continue;
+    unitD = d;
+    unit = { x: other.x, y: other.y, ref: { kind: 'unit', id: other.id } };
+  }
+  if (unit !== null) return unit;
+  let tower: Target | null = null;
+  let towerD = Infinity;
+  for (const t of sim.towers) {
+    if (t.side === attacker.side || t.hp <= 0) continue;
+    const d = (t.x - attacker.x) * (t.x - attacker.x) + (t.y - attacker.y) * (t.y - attacker.y);
+    if (d > r2 || d >= towerD) continue;
+    towerD = d;
+    tower = { x: t.x, y: t.y, ref: { kind: 'tower', id: t.id } };
+  }
+  return tower;
+}
 
 function nearestEnemy(sim: ArenaSim, attacker: ArenaUnit): Target | null {
   const hitsAir = attacker.role !== 'melee';
@@ -645,7 +915,8 @@ function checkKing(sim: ArenaSim): void {
 
 function checkPaint(sim: ArenaSim): void {
   if (sim.over) return;
-  const scores = countScores(sim.grid);
+  const scores = fieldScores(sim.grid);
+  if (scores.open > 0) return;
   if (scores.p1 > 0 && scores.p2 === 0) {
     sim.over = true;
     sim.winner = 1;
@@ -701,6 +972,7 @@ export type UnitView = {
   y: number;
   hp: number;
   maxHp: number;
+  swing: number;
 };
 
 export type TowerView = {
@@ -731,6 +1003,7 @@ export type ArenaView = {
   dirty: { i: number; v: 0 | 1 | 2 }[];
   grid?: string;
   doubleElixir: boolean;
+  mapName: string;
 };
 
 export function arenaView(
@@ -762,6 +1035,7 @@ export function arenaView(
       y: u.y,
       hp: u.hp,
       maxHp: u.maxHp,
+      swing: u.swing,
     })),
     towers: sim.towers.map((t) => ({
       id: t.id,
@@ -782,6 +1056,7 @@ export function arenaView(
     scores: countScores(sim.grid),
     dirty,
     doubleElixir: isDoubleElixir(sim.tick, config),
+    mapName: sim.mapName,
   };
   return view;
 }

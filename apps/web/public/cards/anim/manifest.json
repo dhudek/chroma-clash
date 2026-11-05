@@ -1,0 +1,72 @@
+{
+  "spark": {
+    "idle": 1,
+    "body": 0.9728,
+    "walk": 45,
+    "attack": 14,
+    "walkMs": 1500,
+    "flirt": 22
+  },
+  "brute": {
+    "idle": 1,
+    "body": 0.9709,
+    "walk": 44,
+    "attack": 15,
+    "walkMs": 1500,
+    "flirt": 24
+  },
+  "swarm": {
+    "idle": 1,
+    "body": 0.9728,
+    "walk": 42,
+    "attack": 14,
+    "walkMs": 1500,
+    "flirt": 16
+  },
+  "wisp": {
+    "idle": 1,
+    "body": 0.9579,
+    "walk": 41,
+    "attack": 13,
+    "walkMs": 1500,
+    "flirt": 24
+  },
+  "moth": {
+    "idle": 1,
+    "body": 0.8606,
+    "walk": 43,
+    "attack": 17,
+    "walkMs": 1900,
+    "flirt": 19
+  },
+  "turret": {
+    "idle": 1,
+    "body": 0.8406,
+    "attack": 13,
+    "flirt": 20
+  },
+  "spire": {
+    "idle": 1,
+    "body": 0.7213,
+    "attack": 17,
+    "flirt": 24
+  },
+  "meteor": {
+    "idle": 1,
+    "body": 0.6125,
+    "attack": 17,
+    "flirt": 16
+  },
+  "vale": {
+    "flirt": 24
+  },
+  "bolt": {
+    "flirt": 24
+  },
+  "flare": {
+    "flirt": 16
+  },
+  "lantern": {
+    "flirt": 16
+  }
+}

@@ -2,8 +2,8 @@
 
 Neon 1vCPU / 1v1. Two modes on the same server:
 
-- **Arena** (default) — Color Clash-style: energy, cycling cards, king + side towers, units that paint as they fight. Destroy the king to win.
-- **Spray** — the original painter. WASD, dash, most paint when the clock dies.
+- **Arena** (default) — energy, cycling cards, a fresh random map every match. Open ground starts half pink and half blue, as horizontal stripes, vertical stripes, or jagged blocks, with no center line. Rocks stay rocks. Play a card on your own color; bigger cards need a larger block of it. Ember can drop on any open cell. Admin can retune each card for the next match.
+- **Spray** — the original painter on the same random maps. WASD, dash, most paint when the clock dies. Sprayers appear when the countdown ends.
 
 Authoritative Node 24 server, Hono REST + WebSocket, Vite + React 19.
 

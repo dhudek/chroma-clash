@@ -1,4 +1,4 @@
-import type { ArenaConfig, GameConfig } from '@clash/shared';
+import { mergeCardTable, type ArenaConfig, type CardTable, type GameConfig } from '@clash/shared';
 
 export type Health = {
   ok: true;
@@ -79,6 +79,33 @@ export async function putArenaSettings(
   });
   const body = await readJson<{ settings: ArenaConfig }>(res, 'save');
   return body.settings;
+}
+
+export async function fetchPublicCards(): Promise<CardTable> {
+  const res = await fetch('/api/config');
+  const body = await readJson<{ cards?: unknown }>(res, 'config');
+  return mergeCardTable(body.cards);
+}
+
+export async function fetchCardTable(pin: string): Promise<CardTable> {
+  const res = await fetch('/api/admin/cards', {
+    headers: { 'x-admin-pin': pin },
+  });
+  const body = await readJson<{ cards: CardTable }>(res, 'cards');
+  return mergeCardTable(body.cards);
+}
+
+export async function putCardTable(pin: string, cards: CardTable): Promise<CardTable> {
+  const res = await fetch('/api/admin/cards', {
+    method: 'PUT',
+    headers: {
+      'content-type': 'application/json',
+      'x-admin-pin': pin,
+    },
+    body: JSON.stringify(cards),
+  });
+  const body = await readJson<{ cards: CardTable }>(res, 'save');
+  return mergeCardTable(body.cards);
 }
 
 export async function fetchMatches(pin: string): Promise<MatchRecord[]> {

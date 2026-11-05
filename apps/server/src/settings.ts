@@ -2,8 +2,12 @@ import {
   DEFAULT_ARENA,
   DEFAULT_CONFIG,
   arenaConfigSchema,
+  cardTableSchema,
+  defaultCardTable,
   gameConfigSchema,
+  mergeCardTable,
   type ArenaConfig,
+  type CardTable,
   type GameConfig,
 } from '@clash/shared';
 
@@ -11,6 +15,7 @@ import type { AppDb } from './db.ts';
 
 const SPRAY_KEY = 'game';
 const ARENA_KEY = 'arena';
+const CARDS_KEY = 'cards';
 
 export function loadSettings(db: AppDb): GameConfig {
   return loadJson(db, SPRAY_KEY, DEFAULT_CONFIG, gameConfigSchema.parse);
@@ -26,6 +31,28 @@ export function loadArenaSettings(db: AppDb): ArenaConfig {
 
 export function saveArenaSettings(db: AppDb, config: ArenaConfig): ArenaConfig {
   return saveJson(db, ARENA_KEY, config);
+}
+
+export function loadCardTable(db: AppDb): CardTable {
+  const stmt = db.prepare(`SELECT value FROM settings WHERE key = ?`);
+  const row = stmt.get(CARDS_KEY) as { value: string } | undefined;
+  if (row === undefined) {
+    const fresh = defaultCardTable();
+    saveJson(db, CARDS_KEY, fresh);
+    return fresh;
+  }
+  try {
+    return mergeCardTable(JSON.parse(row.value) as unknown);
+  } catch {
+    const fresh = defaultCardTable();
+    saveJson(db, CARDS_KEY, fresh);
+    return fresh;
+  }
+}
+
+export function saveCardTable(db: AppDb, table: CardTable): CardTable {
+  const parsed = cardTableSchema.parse(table);
+  return saveJson(db, CARDS_KEY, parsed);
 }
 
 function loadJson<T>(

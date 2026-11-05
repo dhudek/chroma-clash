@@ -1,4 +1,4 @@
-import { CARD_CATALOG, type CardId } from '@clash/shared';
+import { CARD_CATALOG, roleLabel, type CardId, type CardTune } from '@clash/shared';
 import type { CSSProperties } from 'react';
 
 export const CARD_LOOK: Record<
@@ -13,20 +13,34 @@ export const CARD_LOOK: Record<
   turret: { accent: '#ffd36a', glow: '#ffb020', ink: '#161004' },
   spire: { accent: '#a8c7ff', glow: '#6ea0ff', ink: '#040816' },
   meteor: { accent: '#ff5ec8', glow: '#ff3d9a', ink: '#1a0412' },
+  vale: { accent: '#ff6b7a', glow: '#ff3d55', ink: '#1a060a' },
+  bolt: { accent: '#5ee0c5', glow: '#2ec9a8', ink: '#041612' },
+  lantern: { accent: '#c4b6ff', glow: '#8d78ff', ink: '#100a1c' },
+  flare: { accent: '#ffb15a', glow: '#ff7a3c', ink: '#1a0c04' },
 };
 
 export function CardFace({
   id,
   compact = false,
+  tune,
 }: {
   id: CardId;
   compact?: boolean;
+  tune?: CardTune;
 }) {
-  const def = CARD_CATALOG[id];
+  const def = tune === undefined ? CARD_CATALOG[id] : { ...CARD_CATALOG[id], ...tune };
   const look = CARD_LOOK[id];
+  const motion =
+    def.role === 'building'
+      ? 'is-tower'
+      : def.role === 'flying'
+        ? 'is-flier'
+        : def.role === 'spell'
+          ? 'is-spell'
+          : 'is-move';
   return (
     <div
-      className={`face face-${id} ${compact ? 'compact' : ''}`}
+      className={`face face-${id} ${motion} ${compact ? 'compact' : ''}`}
       style={
         {
           '--accent': look.accent,
@@ -37,13 +51,22 @@ export function CardFace({
     >
       <div className="face-art" aria-hidden="true">
         <CardGlyph id={id} />
+        <img
+          src={`/cards/${id}.png`}
+          alt=""
+          draggable={false}
+          onError={(e) => {
+            e.currentTarget.style.display = 'none';
+          }}
+        />
         <span className="face-sheen" />
+        {def.span > 1 ? <span className="face-span">{def.span}×{def.span}</span> : null}
       </div>
       <div className="face-meta">
         <span className="cost">{def.cost}</span>
         <strong>{def.name}</strong>
         {compact ? null : <em>{def.blurb}</em>}
-        <span className="role">{def.role}</span>
+        <span className={`role role-${def.role}`}>{roleLabel(def.role)}</span>
       </div>
     </div>
   );
@@ -110,6 +133,35 @@ function CardGlyph({ id }: { id: CardId }) {
           <circle cx="38" cy="26" r="12" fill="#ff3d9a" />
           <path d="M8 52 28 34 34 40z" fill="#ff9ad4" />
           <circle cx="44" cy="20" r="4" fill="#fff" />
+        </svg>
+      );
+    case 'vale':
+      return (
+        <svg viewBox="0 0 64 64">
+          <path d="M30 6h4l2 40h-8z" fill="#ff6b7a" />
+          <path d="M18 48h28l-4 8H22z" fill="#ffd0d6" />
+        </svg>
+      );
+    case 'bolt':
+      return (
+        <svg viewBox="0 0 64 64">
+          <path d="M14 46c16-22 22-22 36-4" fill="none" stroke="#5ee0c5" strokeWidth="4" />
+          <path d="M44 14v28" stroke="#e8fff8" strokeWidth="3" />
+        </svg>
+      );
+    case 'lantern':
+      return (
+        <svg viewBox="0 0 64 64">
+          <rect x="24" y="18" width="16" height="22" rx="6" fill="#ffb15a" />
+          <rect x="30" y="8" width="4" height="12" fill="#c4b6ff" />
+          <path d="M22 42h20l-4 10H26z" fill="#8d78ff" />
+        </svg>
+      );
+    case 'flare':
+      return (
+        <svg viewBox="0 0 64 64">
+          <circle cx="32" cy="28" r="8" fill="#ffb15a" />
+          <path d="M32 8v8M32 40v8M12 28h8M44 28h8" stroke="#fff" strokeWidth="3" />
         </svg>
       );
   }
